@@ -29,7 +29,8 @@ def parametrized_state(
     process = Process()
     qubits = process.alloc(num_qubits)
     for gate in gates:
-        ansatz(gate.value, qubits[gate.target], gate.gate)
+        target = qubits if gate.target is None else qubits[gate.target]
+        ansatz(gate.value, target, gate.gate)
     return qubits
 
 
@@ -70,15 +71,18 @@ def parameter_shift_gradient(
             continue
         total_grad = 0.0
         for inst_idx, mult in multipliers:
-            shifted_forward = shift_param(gates, inst_idx, shift)
-            shifted_backward = shift_param(gates, inst_idx, -shift)
-            forward = expectation(
-                num_qubits, parameters, shifted_forward, operator=operator
+            rule = gates[inst_idx].shift_rule or (
+                (1 / (2 * np.sin(shift)), shift),
             )
-            backward = expectation(
-                num_qubits, parameters, shifted_backward, operator=operator
-            )
-
-            total_grad += mult * (forward - backward) / (2 * np.sin(shift))
+            for coefficient, gate_shift in rule:
+                shifted_forward = shift_param(gates, inst_idx, gate_shift)
+                shifted_backward = shift_param(gates, inst_idx, -gate_shift)
+                forward = expectation(
+                    num_qubits, parameters, shifted_forward, operator=operator
+                )
+                backward = expectation(
+                    num_qubits, parameters, shifted_backward, operator=operator
+                )
+                total_grad += mult * coefficient * (forward - backward)
         gradients.append(total_grad)
     return gradients
