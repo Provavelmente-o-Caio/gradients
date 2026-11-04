@@ -135,38 +135,3 @@ def benchmark_gradient(
     for _ in range(repetitions):
         gradient()
     return (perf_counter() - start) * 1000 / repetitions
-
-
-if __name__ == "__main__":
-    # ----------------------------------------------------------------
-    # Example: 2-qubit hardware-efficient ansatz
-    #   RY(t0) q0 | RY(t1) q1 -- CNOT(q0,q1) -- RY(t2) q0 | RY(t3) q1
-    # Observable: Z0 Z1
-    # ----------------------------------------------------------------
-    NUM_QUBITS = 2
-
-    def observable(q):
-        return Z(q[0]) * Z(q[1])
-
-    thetas = [0.3, 1.1, -0.4, 0.8]
-    generators = [
-        lambda q: Y(q[0]),
-        lambda q: Y(q[1]),
-        lambda q: Y(q[0]),
-        lambda q: Y(q[1]),
-    ]
-    print(f"Cost function value: {cost(thetas, NUM_QUBITS, observable, ansatz):.6f}")
-
-    print("\nMixed-generator example:")
-    mixed_thetas = [0.37]
-    mixed_observable = lambda q: Z(q[0])
-    mixed_hadamard = hadamard_test_gradient(
-        mixed_thetas,
-        0,
-        NUM_QUBITS,
-        mixed_observable,
-        [mixed_generator],
-        mixed_generator_ansatz,
-    )
-    print("Generator: 0.6*X(q[0]) + 0.8*Z(q[1])")
-    print(f"Hadamard test: {mixed_hadamard:.6f}")

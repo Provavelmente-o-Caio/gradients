@@ -3,7 +3,7 @@ from ket.base import Process
 from ket.gates import CNOT, RX, RY, Z, obs
 from ket.operations import ExpValue
 
-from  import (
+from gradients.psr.advanced import (
     GateInstruction,
     expectation,
     parameter_shift_gradient,

@@ -1,4 +1,5 @@
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from time import perf_counter
 
 from ket.base import Process
@@ -14,6 +15,33 @@ type CircuitBuilder = Callable[[Sequence[float], Quant, ParameterGate], None]
 type Segment = Callable[[Quant], None]
 type SegmentsBuilder = Callable[[Sequence[float]], list[Segment]]
 type GeneratorTerm = tuple[complex, tuple[str, ...]]
+type ParameterizedGate = Callable[[float, Quant], object]
+
+
+@dataclass(frozen=True)
+class GateInstruction:
+    gate: ParameterizedGate
+    target: int
+    value: float
+    index: int | None = None
+    multiplier: float = 1.0
+
+    def param_index(self) -> tuple[int | None, float]:
+        return self.index, self.multiplier
+
+
+def shift_param(
+    gates: Sequence[GateInstruction],
+    shift_inst: int,
+    shift_amt: float,
+) -> list[GateInstruction]:
+    """Return a circuit with one gate parameter shifted."""
+    return [
+        replace(instruction, value=instruction.value + shift_amt)
+        if instruction_index == shift_inst
+        else instruction
+        for instruction_index, instruction in enumerate(gates)
+    ]
 
 
 def benchmark_gradient(
