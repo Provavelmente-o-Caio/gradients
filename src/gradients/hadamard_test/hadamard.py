@@ -7,7 +7,7 @@ from ket.expv import Hamiltonian, Pauli
 from ket.gates import CNOT, RY, H, I, S, X, Y, Z, evolve, obs
 from ket.operations import ctrl, exp_value, kron
 
-from gradients.utils.utils import pauli_terms
+from gradients.utils.utils import pauli_expansion
 
 type ObservableBuilder = Callable[[Quant], Hamiltonian | Pauli]
 type GeneratorBuilder = Callable[[Quant], Hamiltonian | Pauli]
@@ -23,9 +23,7 @@ def controlled_pauli(
 ) -> None:
     gates = {"I": I, "X": X, "Y": Y, "Z": Z}
     circuit_qubits = [qubits[index] for index in range(len(qubits))]
-    pauli_gates = [
-        gates[pauli_word[index]] for index in range(len(circuit_qubits))
-    ]
+    pauli_gates = [gates[pauli_word[index]] for index in range(len(circuit_qubits))]
     ctrl(control, kron(*pauli_gates))(*circuit_qubits)
 
 
@@ -103,17 +101,8 @@ def hadamard_test_gradient(
     """
     if not 0 <= parameter_index < len(generators):
         raise IndexError(f"Parameter index {parameter_index} is out of range")
-    process = Process()
-    qubits = process.alloc(num_qubits)
-    with obs():
-        generator = generators[parameter_index](qubits)
-        terms = tuple(
-            (
-                term.coef,
-                tuple(term.map.get(qubit.qubits[0], "I") for qubit in qubits),
-            )
-            for term in pauli_terms(generator)
-        )
+
+    terms = pauli_expansion(generators[parameter_index], num_qubits)
     return sum(
         hadamard_test_term(
             thetas,
@@ -198,14 +187,7 @@ if __name__ == "__main__":
         lambda q: Y(q[0]),
         lambda q: Y(q[1]),
     ]
-    print(f"Cost function value: {cost(thetas, NUM_QUBITS, observable, ansatz):.6f}\n")
-
-    print(f"{'param':>6} | {'Hadamard test':>15} | {'KET shift':>12}")
-    print("-" * 56)
-    for k in range(len(thetas)):
-        g_had = hadamard_test_gradient(
-            thetas, k, NUM_QUBITS, observable, generators, ansatz
-        )
+    print(f"Cost function value: {cost(thetas, NUM_QUBITS, observable, ansatz):.6f}")
 
     print("\nMixed-generator example:")
     mixed_thetas = [0.37]

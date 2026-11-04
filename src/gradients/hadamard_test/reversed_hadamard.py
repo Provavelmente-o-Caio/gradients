@@ -5,15 +5,22 @@ from ket.base import Process
 from ket.base.quant import Quant
 from ket.expv import Hamiltonian, Pauli
 from ket.gates import CNOT, RY, H, I, S, X, Y, Z, evolve, obs
-from ket.operations import ctrl, exp_value, kron
+from ket.operations import adj, ctrl, exp_value, kron
 
-from gradients.utils.utils import pauli_terms
+from gradients.utils.utils import pauli_expansion, pauli_terms
 
 type ObservableBuilder = Callable[[Quant], Hamiltonian | Pauli]
 type GeneratorBuilder = Callable[[Quant], Hamiltonian | Pauli]
 type ParameterGate = Callable[[float, int, Callable[..., object], Quant], None]
 type CircuitBuilder = Callable[[Sequence[float], Quant, ParameterGate], None]
+type Segment = Callable[[Quant], None]
+type SegmentsBuilder = Callable[[Sequence[float]], list[Segment]]
 type GeneratorTerm = tuple[complex, tuple[str, ...]]
+
+
+def apply_segments(segments: Sequence[Segment], qubits: Quant):
+    for segment in segments:
+        segment(qubits)
 
 
 def controlled_pauli(
@@ -23,9 +30,7 @@ def controlled_pauli(
 ) -> None:
     gates = {"I": I, "X": X, "Y": Y, "Z": Z}
     circuit_qubits = [qubits[index] for index in range(len(qubits))]
-    pauli_gates = [
-        gates[pauli_word[index]] for index in range(len(circuit_qubits))
-    ]
+    pauli_gates = [gates[pauli_word[index]] for index in range(len(circuit_qubits))]
     ctrl(control, kron(*pauli_gates))(*circuit_qubits)
 
 
@@ -54,47 +59,43 @@ def cost(
     return exp_value(hamiltonian).get()
 
 
-def hadamard_test_term(
+def reversed_hadmard_test_term(
     thetas: Sequence[float],
     parameter_index: int,
     term: GeneratorTerm,
     num_qubits: int,
-    observable_builder: ObservableBuilder,
-    circuit_builder: CircuitBuilder,
+    generator_builder: GeneratorBuilder,
+    segments_builder: SegmentsBuilder,
 ) -> float:
     """Evaluate one native KET Pauli term of a parameter gradient."""
     process = Process()
     ancilla = process.alloc()
     qubits = process.alloc(num_qubits)
-    X(ancilla)
+
     H(ancilla)
     S(ancilla)
+
+    segments = segments_builder(thetas)
+    suffix = segments[parameter_index + 1 :]
     coefficient, pauli_word = term
 
-    def controlled_parameter_gate(
-        theta: float,
-        parameter: int,
-        gate: Callable[..., object],
-        target: Quant,
-    ) -> None:
-        if parameter == parameter_index:
-            controlled_pauli(pauli_word, qubits, ancilla)
-        gate(theta, target)
+    apply_segments(segments, qubits)
+    controlled_pauli(pauli_word, qubits, ancilla)
+    adj(apply_segments)(suffix, qubits)
 
-    circuit_builder(thetas, qubits, controlled_parameter_gate)
     H(ancilla)
     with obs():
-        full_observable = Z(ancilla) * observable_builder(qubits)
+        full_observable = Z(ancilla) * generator_builder(qubits)
     return coefficient * exp_value(full_observable).get()
 
 
-def hadamard_test_gradient(
+def reversed_hadamard_test_gradient(
     thetas: Sequence[float],
     parameter_index: int,
     num_qubits: int,
     observable_builder: ObservableBuilder,
     generators: Sequence[GeneratorBuilder],
-    circuit_builder: CircuitBuilder,
+    segments_builder: SegmentsBuilder,
 ) -> float:
     """Sum the Hadamard-test terms for one parameter gradient.
 
@@ -103,25 +104,15 @@ def hadamard_test_gradient(
     """
     if not 0 <= parameter_index < len(generators):
         raise IndexError(f"Parameter index {parameter_index} is out of range")
-    process = Process()
-    qubits = process.alloc(num_qubits)
-    with obs():
-        generator = generators[parameter_index](qubits)
-        terms = tuple(
-            (
-                term.coef,
-                tuple(term.map.get(qubit.qubits[0], "I") for qubit in qubits),
-            )
-            for term in pauli_terms(generator)
-        )
+    terms = pauli_expansion(observable_builder, num_qubits)
     return sum(
-        hadamard_test_term(
+        reversed_hadmard_test_term(
             thetas,
             parameter_index,
             term,
             num_qubits,
-            observable_builder,
-            circuit_builder,
+            generators[parameter_index],
+            segments_builder,
         )
         for term in terms
     )
@@ -131,6 +122,20 @@ def mixed_generator(qubits: Quant) -> Hamiltonian:
     """A generator with multiple Pauli terms and non-binary eigenvalues."""
     with obs():
         return 0.6 * X(qubits[0]) + 0.8 * Z(qubits[1])
+
+
+def ansatz_segments(thetas: Sequence[float]):
+    """Segment j = fixed gates before gate j, followed by gate j."""
+    return [
+        lambda q: RY(thetas[0], q[0]),
+        lambda q: RY(thetas[1], q[1]),
+        lambda q: (CNOT(q[0], q[1]), RY(thetas[2], q[0])),
+        lambda q: RY(thetas[3], q[1]),
+    ]
+
+
+def mixed_generator_segments(thetas: Sequence[float]):
+    return [lambda q: evolve(mixed_generator(q) * (thetas[0] / 2))]
 
 
 def mixed_generator_ansatz(
@@ -198,25 +203,31 @@ if __name__ == "__main__":
         lambda q: Y(q[0]),
         lambda q: Y(q[1]),
     ]
-    print(f"Cost function value: {cost(thetas, NUM_QUBITS, observable, ansatz):.6f}\n")
+    print(f"Cost function value: {cost(thetas, NUM_QUBITS, observable, ansatz):.6f}")
 
-    print(f"{'param':>6} | {'Hadamard test':>15} | {'KET shift':>12}")
-    print("-" * 56)
+    print(f"{'param':>6} | {'Reversed Hadamard test':>23}")
+    print("-" * 36)
     for k in range(len(thetas)):
-        g_had = hadamard_test_gradient(
-            thetas, k, NUM_QUBITS, observable, generators, ansatz
+        reversed_gradient = reversed_hadamard_test_gradient(
+            thetas,
+            k,
+            NUM_QUBITS,
+            observable,
+            generators,
+            ansatz_segments,
         )
+        print(f"{k:>6} | {reversed_gradient:>23.6f}")
 
     print("\nMixed-generator example:")
     mixed_thetas = [0.37]
     mixed_observable = lambda q: Z(q[0])
-    mixed_hadamard = hadamard_test_gradient(
+    mixed_hadamard = reversed_hadamard_test_gradient(
         mixed_thetas,
         0,
         NUM_QUBITS,
         mixed_observable,
         [mixed_generator],
-        mixed_generator_ansatz,
+        mixed_generator_segments,
     )
     print("Generator: 0.6*X(q[0]) + 0.8*Z(q[1])")
     print(f"Hadamard test: {mixed_hadamard:.6f}")
