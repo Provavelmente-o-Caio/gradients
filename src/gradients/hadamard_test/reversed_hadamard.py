@@ -1,62 +1,28 @@
-from collections.abc import Callable, Sequence
-from time import perf_counter
+from collections.abc import Sequence
 
 from ket.base import Process
 from ket.base.quant import Quant
-from ket.expv import Hamiltonian, Pauli
-from ket.gates import CNOT, RY, H, I, S, X, Y, Z, evolve, obs
-from ket.operations import adj, ctrl, exp_value, kron
+from ket.expv import Hamiltonian
+from ket.gates import CNOT, RY, H, S, X, Y, Z, evolve, obs
+from ket.operations import adj, exp_value
 
-from gradients.utils.utils import pauli_expansion, pauli_terms
-
-type ObservableBuilder = Callable[[Quant], Hamiltonian | Pauli]
-type GeneratorBuilder = Callable[[Quant], Hamiltonian | Pauli]
-type ParameterGate = Callable[[float, int, Callable[..., object], Quant], None]
-type CircuitBuilder = Callable[[Sequence[float], Quant, ParameterGate], None]
-type Segment = Callable[[Quant], None]
-type SegmentsBuilder = Callable[[Sequence[float]], list[Segment]]
-type GeneratorTerm = tuple[complex, tuple[str, ...]]
+from gradients.utils.utils import (
+    GeneratorBuilder,
+    GeneratorTerm,
+    ObservableBuilder,
+    ParameterGate,
+    Segment,
+    SegmentsBuilder,
+    controlled_pauli,
+    cost,
+    direct_parameter_gate,
+    pauli_expansion,
+)
 
 
 def apply_segments(segments: Sequence[Segment], qubits: Quant):
     for segment in segments:
         segment(qubits)
-
-
-def controlled_pauli(
-    pauli_word: tuple[str, ...],
-    qubits: Quant,
-    control: Quant,
-) -> None:
-    gates = {"I": I, "X": X, "Y": Y, "Z": Z}
-    circuit_qubits = [qubits[index] for index in range(len(qubits))]
-    pauli_gates = [gates[pauli_word[index]] for index in range(len(circuit_qubits))]
-    ctrl(control, kron(*pauli_gates))(*circuit_qubits)
-
-
-def direct_parameter_gate(
-    theta: float,
-    parameter: int,
-    gate: Callable[..., object],
-    target: Quant,
-) -> None:
-    """Apply a parameterized gate in an ordinary KET circuit."""
-    gate(theta, target)
-
-
-def cost(
-    thetas: Sequence[float],
-    num_qubits: int,
-    observable_builder: ObservableBuilder,
-    circuit_builder: CircuitBuilder,
-) -> float:
-    """Return ``<M>`` for the circuit at parameters ``thetas``."""
-    p = Process()
-    qubits = p.alloc(num_qubits)
-    circuit_builder(thetas, qubits, direct_parameter_gate)
-    with obs():
-        hamiltonian = observable_builder(qubits)
-    return exp_value(hamiltonian).get()
 
 
 def reversed_hadmard_test_term(
@@ -168,21 +134,6 @@ def ansatz(
     CNOT(qubits[0], qubits[1])
     parameter_gate(thetas[2], 2, RY, qubits[0])
     parameter_gate(thetas[3], 3, RY, qubits[1])
-
-
-def benchmark_gradient(
-    gradient: Callable[[], float],
-    repetitions: int = 10,
-) -> float:
-    """Return the average runtime of a gradient evaluation in milliseconds."""
-    if repetitions <= 0:
-        raise ValueError("The number of repetitions must be positive")
-
-    gradient()
-    start = perf_counter()
-    for _ in range(repetitions):
-        gradient()
-    return (perf_counter() - start) * 1000 / repetitions
 
 
 if __name__ == "__main__":
