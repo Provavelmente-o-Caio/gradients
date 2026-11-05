@@ -29,8 +29,12 @@ def parametrized_state(
     process = Process()
     qubits = process.alloc(num_qubits)
     for gate in gates:
-        target = qubits if gate.target is None else qubits[gate.target]
-        ansatz(gate.value, target, gate.gate)
+        if gate.target is None:
+            gate.gate(gate.value, qubits)
+        elif isinstance(gate.target, tuple):
+            gate.gate(gate.value, *(qubits[index] for index in gate.target))
+        else:
+            ansatz(gate.value, qubits[gate.target], gate.gate)
     return qubits
 
 
@@ -68,6 +72,7 @@ def parameter_shift_gradient(
             if idx is not None and mult and idx == param_idx:
                 multipliers.append((inst_idx, mult))
         if len(multipliers) == 0:
+            gradients.append(0.0)
             continue
         total_grad = 0.0
         for inst_idx, mult in multipliers:

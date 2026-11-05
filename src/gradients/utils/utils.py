@@ -17,7 +17,7 @@ type CircuitBuilder = Callable[[Sequence[float], Quant, ParameterGate], None]
 type Segment = Callable[[Quant], None]
 type SegmentsBuilder = Callable[[Sequence[float]], list[Segment]]
 type GeneratorTerm = tuple[complex, tuple[str, ...]]
-type ParameterizedGate = Callable[[float, Quant], object]
+type ParameterizedGate = Callable[..., object]
 type PauliWord = tuple[str, ...]
 type PauliTerm = tuple[float, PauliWord]
 type ShiftRule = tuple[tuple[float, float], ...]
@@ -84,7 +84,7 @@ def grouped_expectation(build_state, groups: Sequence[MeasurementGroup]) -> floa
 @dataclass(frozen=True)
 class GateInstruction:
     gate: ParameterizedGate
-    target: int | None
+    target: int | tuple[int, ...] | None
     value: float
     index: int | None = None
     multiplier: float = 1.0
