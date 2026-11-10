@@ -89,9 +89,16 @@ class GateInstruction:
     index: int | None = None
     multiplier: float = 1.0
     shift_rule: ShiftRule | None = None
+    offset: float = 0.0
 
     def param_index(self) -> tuple[int | None, float]:
         return self.index, self.multiplier
+
+    def angle(self, parameters: Sequence[float]) -> float:
+        """Return the angle to apply, resolving parameters when applicable."""
+        if self.index is None or self.multiplier == 0:
+            return float(self.value)
+        return float(parameters[self.index] * self.multiplier + self.offset)
 
 
 def shift_param(
@@ -101,7 +108,11 @@ def shift_param(
 ) -> list[GateInstruction]:
     """Return a circuit with one gate parameter shifted."""
     return [
-        replace(instruction, value=instruction.value + shift_amt)
+        replace(
+            instruction,
+            value=instruction.value + shift_amt,
+            offset=instruction.offset + shift_amt,
+        )
         if instruction_index == shift_inst
         else instruction
         for instruction_index, instruction in enumerate(gates)
@@ -110,20 +121,32 @@ def shift_param(
 
 def spectral_shift_rule(eigenvalues: Sequence[float]) -> ShiftRule:
     """Build an exact symmetric shift rule from generator eigenvalues."""
-    gaps = sorted(
-        {
-            abs(left - right) / 2
-            for left in eigenvalues
-            for right in eigenvalues
-            if abs(left - right) > 1e-12
-        }
-    )
-    if not gaps:
+
+    tolerance = 1e-12
+
+    gaps = np.array(sorted({
+        abs(left - right)
+        for left in eigenvalues
+        for right in eigenvalues
+        if abs(left - right) > tolerance
+    }))
+
+    if len(gaps) == 0:
         return ()
 
-    shifts = np.arange(1, len(gaps) + 1) * pi / (2 * max(gaps) + 1)
-    matrix = 2 * np.sin(np.outer(gaps, shifts))
-    coefficients = np.linalg.solve(matrix, np.asarray(gaps))
+    shifts = (
+        np.arange(1, len(gaps) + 1)
+        * pi / (max(gaps) + 1)
+    )
+
+    matrix = 4 * np.sin(
+        np.outer(shifts, gaps) / 2
+    )
+
+    # d f / d x = c.T @ F
+    # M.T @ c = Delta
+    coefficients = np.linalg.solve(matrix.T, gaps)
+
     return tuple(
         (float(coefficient), float(shift))
         for coefficient, shift in zip(coefficients, shifts)
@@ -154,7 +177,7 @@ def cost(
     """Return ``<M>`` for the circuit at parameters ``thetas``."""
     p = Process()
     qubits = p.alloc(num_qubits)
-    circuit_builder(thetas, qubits, direct_parameter_gate)
+    circuit_builder(thetas, qubits, ansatz)
     with obs():
         hamiltonian = observable_builder(qubits)
     return exp_value(hamiltonian).get()
@@ -176,9 +199,8 @@ def pauli_terms(operator: Hamiltonian | Pauli) -> Sequence[Pauli]:
     return operator.terms if isinstance(operator, Hamiltonian) else (operator,)
 
 
-def direct_parameter_gate(
+def ansatz(
     theta: float,
-    parameter: int,
     gate: Callable[..., object],
     target: Quant,
 ) -> None:

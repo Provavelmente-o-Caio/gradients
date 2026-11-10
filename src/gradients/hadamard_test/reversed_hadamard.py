@@ -2,8 +2,7 @@ from collections.abc import Sequence
 from functools import partial
 
 from ket.base import Process
-from ket.base.quant import Quant
-from ket.gates import H, S, Z, obs
+from ket.gates import H, S, X, Z, obs
 from ket.operations import adj, exp_value
 
 from gradients.utils.utils import (
@@ -14,22 +13,17 @@ from gradients.utils.utils import (
     PauliTerm,
     Segment,
     SegmentsBuilder,
+    apply_segments,
     controlled_pauli,
     group_qubit_commuting,
     grouped_expectation,
     pauli_expansion,
 )
 
-
-def apply_segments(segments: Sequence[Segment], qubits: Quant) -> None:
-    for segment in segments:
-        segment(qubits)
-
-
 adjoint_apply_segments = adj(apply_segments)
 
 
-def reversed_hadmard_test_term(
+def reversed_hadamard_test_term(
     parameter_index: int,
     term: GeneratorTerm,
     num_qubits: int,
@@ -41,6 +35,7 @@ def reversed_hadmard_test_term(
     ancilla = process.alloc()
     qubits = process.alloc(num_qubits)
 
+    X(ancilla)
     H(ancilla)
     S(ancilla)
 
@@ -74,8 +69,8 @@ def reversed_hadamard_test_gradient(
         raise IndexError(f"Parameter index {parameter_index} is out of range")
     terms = pauli_expansion(observable_builder, num_qubits)
     segments = segments_builder(thetas)
-    return sum(
-        reversed_hadmard_test_term(
+    return -sum(
+        reversed_hadamard_test_term(
             parameter_index,
             term,
             num_qubits,
@@ -90,6 +85,7 @@ def rht_state(thetas, parameter_index, pauli_word, num_qubits, segments_builder)
     process = Process()
     ancilla = process.alloc()
     qubits = process.alloc(num_qubits)
+    X(ancilla)
     H(ancilla)
     S(ancilla)
     segments = segments_builder(thetas)
@@ -131,4 +127,4 @@ def reversed_hadamard_test_gradient_grouped(
             rht_state, thetas, parameter_index, word, num_qubits, segments_builder
         )
         grad += alpha * grouped_expectation(build, groups)
-    return grad, len(obs_terms) * len(groups)
+    return -grad, len(obs_terms) * len(groups)

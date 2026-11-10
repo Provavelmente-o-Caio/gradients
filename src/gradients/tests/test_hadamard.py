@@ -17,21 +17,21 @@ from gradients.psr.advanced import (
 )
 from gradients.utils.utils import (
     ParameterGate,
+    ansatz as default_ansatz,
     cost,
-    direct_parameter_gate,
 )
 
 
 def ansatz(
     thetas: list[float],
     qubits: Quant,
-    parameter_gate: ParameterGate = direct_parameter_gate,
+    parameter_gate: ParameterGate = default_ansatz,
 ) -> None:
-    parameter_gate(thetas[0], 0, RY, qubits[0])
-    parameter_gate(thetas[1], 1, RY, qubits[1])
+    parameter_gate(thetas[0], RY, qubits[0])
+    parameter_gate(thetas[1], RY, qubits[1])
     CNOT(qubits[0], qubits[1])
-    parameter_gate(thetas[2], 2, RY, qubits[0])
-    parameter_gate(thetas[3], 3, RY, qubits[1])
+    parameter_gate(thetas[2], RY, qubits[0])
+    parameter_gate(thetas[3], RY, qubits[1])
 
 
 def ansatz_segments(thetas: list[float]):
@@ -54,11 +54,10 @@ def mixed_generator(qubits: Quant):
 def mixed_generator_ansatz(
     thetas: list[float],
     qubits: Quant,
-    parameter_gate: ParameterGate = direct_parameter_gate,
+    parameter_gate: ParameterGate = default_ansatz,
 ) -> None:
     parameter_gate(
         thetas[0],
-        0,
         lambda theta, _target: evolve(mixed_generator(qubits) * (theta / 2)),
         qubits[0],
     )

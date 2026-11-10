@@ -1,6 +1,8 @@
 from collections.abc import Sequence
 
 import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from ket import Process
 from ket.base.quant import Quant
 from ket.gates import H, X, Z, evolve, obs
@@ -20,8 +22,9 @@ from gradients.utils.utils import (
     GeneratorBuilder,
     ParameterGate,
     Segment,
+    ansatz as default_ansatz,
     benchmark_gradient,
-    direct_parameter_gate,
+    pauli_expansion,
     spectral_shift_rule,
 )
 
@@ -30,6 +33,9 @@ NUM_NODES = 5
 DEPTH = 2
 PARAMETERS = [0.5] * (2 * DEPTH)
 REPETITIONS = 100
+TRAINING_STEPS = 8
+LEARNING_RATE = 0.05
+CIRCUIT_BUDGET = 300
 
 
 def cost_h(edges: Sequence[tuple[int, int]], qubits: Quant):
@@ -50,7 +56,7 @@ def qaoa(
     edges: Sequence[tuple[int, int]],
     num_nodes: int,
 ) -> Quant:
-    process = Process()
+    process = Process(num_qubits=num_nodes)
     qubits = process.alloc(num_nodes)
     H(qubits)
     for layer in range(len(parameters) // 2):
@@ -92,7 +98,6 @@ def qaoa_parameter_gate(
     )
     parameter_gate(
         theta,
-        parameter_index,
         lambda value, _target: evolve(hamiltonian * value),
         qubits,
     )
@@ -101,7 +106,7 @@ def qaoa_parameter_gate(
 def qaoa_ansatz(
     parameters: Sequence[float],
     qubits: Quant,
-    parameter_gate: ParameterGate = direct_parameter_gate,
+    parameter_gate: ParameterGate = default_ansatz,
 ) -> None:
     H(qubits)
     for parameter_index, theta in enumerate(parameters):
@@ -123,7 +128,7 @@ def qaoa_segments(parameters: Sequence[float]) -> list[Segment]:
                 qaoa_parameter_gate(
                     EDGES,
                     index,
-                    direct_parameter_gate,
+                    default_ansatz,
                     value,
                     qubits,
                 ),
@@ -244,8 +249,11 @@ def cost_h_for_psr(qubits: Quant):
     return cost_h(EDGES, qubits)
 
 
-def qaoa_native_gradient(parameters: Sequence[float]) -> list[float]:
-    process = Process(gradient=True)
+def qaoa_ket_gradient(
+    parameters: Sequence[float],
+    strategy: str,
+) -> list[float]:
+    process = Process(gradient=strategy)
     qubits = process.alloc(NUM_NODES)
     registered = [process.param(theta) for theta in parameters]
     H(qubits)
@@ -258,6 +266,232 @@ def qaoa_native_gradient(parameters: Sequence[float]) -> list[float]:
     return [parameter.grad for parameter in registered]
 
 
+def qaoa_native_psr_gradient(parameters: Sequence[float]) -> list[float]:
+    return qaoa_ket_gradient(parameters, "ParameterShiftRule")
+
+
+def qaoa_native_hadamard_gradient(parameters: Sequence[float]) -> list[float]:
+    return qaoa_ket_gradient(parameters, "HadamardTest")
+
+
+def _gradient_with_circuit_count(
+    name: str,
+    parameters: Sequence[float],
+) -> tuple[list[float], int]:
+    if name in {"KET PSR", "KET Hadamard"}:
+        gradient = (
+            qaoa_native_psr_gradient(parameters)
+            if name == "KET PSR"
+            else qaoa_native_hadamard_gradient(parameters)
+        )
+        return gradient, 1
+    if name == "PSR":
+        count = 0
+        for index in range(len(parameters)):
+            eigenvalues = (
+                [
+                    -2
+                    * sum(
+                        ((bits >> left) & 1) != ((bits >> right) & 1)
+                        for left, right in EDGES
+                    )
+                    for bits in range(1 << NUM_NODES)
+                ]
+                if index % 2 == 0
+                else [
+                    2
+                    * sum(
+                        1 if (bits >> qubit) & 1 else -1
+                        for qubit in range(NUM_NODES)
+                    )
+                    for bits in range(1 << NUM_NODES)
+                ]
+            )
+            count += 2 * len(spectral_shift_rule(eigenvalues))
+        return qaoa_psr_gradient(parameters), count
+    if name in {"Hadamard", "Reversed Hadamard"}:
+        observable_terms = len(
+            pauli_expansion(lambda qubits: cost_h(EDGES, qubits), NUM_NODES)
+        )
+        generator_terms = sum(
+            len(pauli_expansion(generator, NUM_NODES))
+            for generator in qaoa_generators()
+        )
+        gradient = (
+            qaoa_hadamard_gradient(parameters)
+            if name == "Hadamard"
+            else qaoa_reversed_gradient(parameters)
+        )
+        return gradient, observable_terms * generator_terms
+    if name == "Grouped Hadamard":
+        values = [
+            hadamard_test_gradient_grouped(
+                parameters,
+                index,
+                NUM_NODES,
+                lambda qubits: cost_h(EDGES, qubits),
+                qaoa_generators(),
+                qaoa_ansatz,
+            )
+            for index in range(len(parameters))
+        ]
+    else:
+        values = [
+            reversed_hadamard_test_gradient_grouped(
+                parameters,
+                index,
+                NUM_NODES,
+                lambda qubits: cost_h(EDGES, qubits),
+                qaoa_generators(),
+                qaoa_segments,
+            )
+            for index in range(len(parameters))
+        ]
+    return [value for value, _ in values], sum(count for _, count in values)
+
+
+def qaoa_budget_training_plot(
+    initial_parameters: Sequence[float] = PARAMETERS,
+    budget: int = CIRCUIT_BUDGET,
+    learning_rate: float = LEARNING_RATE,
+    output_path: str | None = None,
+) -> go.Figure:
+    """Compare exact training against a common circuit-execution budget."""
+    methods = (
+        "PSR",
+        "KET PSR",
+        "KET Hadamard",
+        "Hadamard",
+        "Reversed Hadamard",
+        "Grouped Hadamard",
+        "Grouped Reversed Hadamard",
+    )
+    figure = go.Figure()
+    for name in methods:
+        parameters = list(initial_parameters)
+        executions = 1
+        x_values = [executions]
+        costs = [objective(parameters)]
+        while executions < budget:
+            gradient, gradient_executions = _gradient_with_circuit_count(
+                name, parameters
+            )
+            if executions + gradient_executions + 1 > budget:
+                break
+            parameters = [
+                parameter - learning_rate * derivative
+                for parameter, derivative in zip(parameters, gradient)
+            ]
+            executions += gradient_executions + 1
+            x_values.append(executions)
+            costs.append(objective(parameters))
+        figure.add_trace(
+            go.Scatter(
+                x=x_values,
+                y=costs,
+                mode="lines+markers",
+                name=name,
+                hovertemplate=f"{name}<br>circuits=%{{x}}<br>cost=%{{y:.12f}}<extra></extra>",
+            )
+        )
+    figure.update_layout(
+        title="QAOA Max-Cut exact training loss by circuit budget",
+        xaxis_title="Distinct circuit executions",
+        yaxis_title="Loss",
+    )
+    if output_path is not None:
+        figure.write_html(output_path)
+    return figure
+
+
+def qaoa_training_plot(
+    initial_parameters: Sequence[float] = PARAMETERS,
+    steps: int = TRAINING_STEPS,
+    learning_rate: float = LEARNING_RATE,
+    output_path: str | None = None,
+) -> go.Figure:
+    """Plot cost evolution while training with each gradient method."""
+    methods = {
+        "PSR": qaoa_psr_gradient,
+        "KET PSR": qaoa_native_psr_gradient,
+        "KET Hadamard": qaoa_native_hadamard_gradient,
+        "Hadamard": qaoa_hadamard_gradient,
+        "Reversed Hadamard": qaoa_reversed_gradient,
+        "Grouped Hadamard": qaoa_grouped_hadamard_gradient,
+        "Grouped Reversed Hadamard": qaoa_grouped_reversed_gradient,
+    }
+    histories = {}
+    for name, gradient_method in methods.items():
+        parameters = list(initial_parameters)
+        costs = [objective(parameters)]
+        for _ in range(steps):
+            gradient = gradient_method(parameters)
+            parameters = [
+                parameter - learning_rate * derivative
+                for parameter, derivative in zip(parameters, gradient)
+            ]
+            costs.append(objective(parameters))
+        histories[name] = costs
+
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=("Expected cost", "Difference from KET PSR"),
+    )
+    styles = [
+        ("circle", "solid"),
+        ("square", "dash"),
+        ("diamond", "dot"),
+        ("triangle-up", "dashdot"),
+        ("triangle-down", "longdash"),
+        ("star", "longdashdot"),
+        ("hexagon", "solid"),
+    ]
+    for (name, costs), (symbol, dash) in zip(histories.items(), styles):
+        figure.add_trace(
+            go.Scatter(
+                x=list(range(steps + 1)),
+                y=costs,
+                mode="lines+markers",
+                name=name,
+                marker_symbol=symbol,
+                line_dash=dash,
+                hovertemplate=f"{name}<br>step=%{{x}}<br>cost=%{{y:.12f}}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=list(range(steps + 1)),
+                y=[
+                    value - reference
+                    for value, reference in zip(costs, histories["KET PSR"])
+                ],
+                mode="lines+markers",
+                name=f"{name} difference",
+                marker_symbol=symbol,
+                line_dash=dash,
+                showlegend=False,
+                hovertemplate=f"{name}<br>step=%{{x}}<br>difference=%{{y:.3e}}<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+    figure.update_layout(
+        title="QAOA Max-Cut training cost",
+        height=800,
+        xaxis2_title="Optimization step",
+        yaxis_title="Expected cost",
+        yaxis2_title="Cost difference",
+    )
+    if output_path is not None:
+        figure.write_html(output_path)
+    return figure
+
+
 def test_qaoa_hadamard_gradient_methods_agree() -> None:
     hadamard = qaoa_hadamard_gradient(PARAMETERS)
     reversed_hadamard = qaoa_reversed_gradient(PARAMETERS)
@@ -268,13 +502,18 @@ def test_qaoa_hadamard_gradient_methods_agree() -> None:
     assert np.allclose(hadamard, grouped_hadamard, atol=2e-5)
     assert np.allclose(hadamard, grouped_reversed, atol=2e-5)
     assert np.allclose(qaoa_psr_gradient(PARAMETERS), hadamard, atol=2e-5)
-    assert np.allclose(qaoa_native_gradient(PARAMETERS), hadamard, atol=2e-5)
+    native_psr = qaoa_native_psr_gradient(PARAMETERS)
+    native_hadamard = qaoa_native_hadamard_gradient(PARAMETERS)
+    assert np.allclose(native_psr, hadamard, atol=2e-5)
+    assert np.allclose(native_hadamard, hadamard, atol=2e-5)
+    assert np.allclose(native_psr, native_hadamard, atol=2e-5)
 
 
 def test_qaoa_gradient_performance() -> None:
     methods = {
         "PSR": lambda: qaoa_psr_gradient(PARAMETERS),
-        "KET native": lambda: qaoa_native_gradient(PARAMETERS),
+        "KET PSR": lambda: qaoa_native_psr_gradient(PARAMETERS),
+        "KET Hadamard": lambda: qaoa_native_hadamard_gradient(PARAMETERS),
         "Hadamard": lambda: qaoa_hadamard_gradient(PARAMETERS),
         "Reversed Hadamard": lambda: qaoa_reversed_gradient(PARAMETERS),
         "Grouped Hadamard": lambda: qaoa_grouped_hadamard_gradient(
@@ -306,6 +545,20 @@ def test_qaoa_gradient_performance() -> None:
         print(f"{name:>18}: {benchmark_gradient(method, REPETITIONS):8.3f} ms")
 
 
+def test_qaoa_training_plot() -> None:
+    figure = qaoa_training_plot(steps=1)
+    assert len(figure.data) == 14
+    assert all(len(trace.y) == 2 for trace in figure.data)
+
+
+def test_qaoa_budget_training_plot() -> None:
+    figure = qaoa_budget_training_plot(budget=20)
+    assert len(figure.data) == 7
+    assert all(len(trace.x) == len(trace.y) for trace in figure.data)
+
+
 if __name__ == "__main__":
     test_qaoa_hadamard_gradient_methods_agree()
     test_qaoa_gradient_performance()
+    qaoa_training_plot(output_path="qaoa_maxcut_training.html")
+    qaoa_budget_training_plot(output_path="qaoa_maxcut_circuit_budget.html")

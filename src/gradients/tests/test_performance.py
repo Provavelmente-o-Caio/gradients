@@ -18,8 +18,8 @@ from gradients.tests.test_hadamard import (
 from gradients.utils.utils import (
     GateInstruction,
     ParameterGate,
+    ansatz as default_ansatz,
     benchmark_gradient,
-    direct_parameter_gate,
     group_qubit_commuting,
     pauli_expansion,
 )
@@ -54,10 +54,10 @@ def many_z_observable(qubits: Quant):
 def many_qubit_ansatz(
     thetas: list[float],
     qubits: Quant,
-    parameter_gate: ParameterGate = direct_parameter_gate,
+    parameter_gate: ParameterGate = default_ansatz,
 ) -> None:
     for parameter_index, theta in enumerate(thetas):
-        parameter_gate(theta, parameter_index, RY, qubits[parameter_index])
+        parameter_gate(theta, RY, qubits[parameter_index])
 
 
 def many_qubit_segments(thetas: list[float]):
@@ -141,11 +141,11 @@ def test_grouping_performance_opportunity() -> None:
 def benchmark_ansatz(
     thetas: list[float],
     qubits: Quant,
-    parameter_gate: ParameterGate = direct_parameter_gate,
+    parameter_gate: ParameterGate = default_ansatz,
 ) -> None:
     targets = [0, 1, 0, 1]
     for parameter_index, theta in enumerate(thetas):
-        parameter_gate(theta, parameter_index, RY, qubits[targets[parameter_index]])
+        parameter_gate(theta, RY, qubits[targets[parameter_index]])
 
 
 def benchmark_segments(thetas: list[float]):

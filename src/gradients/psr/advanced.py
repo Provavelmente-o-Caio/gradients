@@ -17,7 +17,7 @@ from gradients.utils.utils import (
 
 # |ψ(θ)> = RY(θ)|0>
 def ansatz(theta: float, qubits: Quant, gate: ParameterizedGate = RY) -> None:
-    _ = gate(theta, qubits)
+    gate(float(theta), qubits)
 
 
 # |ψ(θ)>
@@ -29,12 +29,13 @@ def parametrized_state(
     process = Process()
     qubits = process.alloc(num_qubits)
     for gate in gates:
+        angle = gate.angle(parameters)
         if gate.target is None:
-            gate.gate(gate.value, qubits)
+            gate.gate(angle, qubits)
         elif isinstance(gate.target, tuple):
-            gate.gate(gate.value, *(qubits[index] for index in gate.target))
+            gate.gate(angle, *(qubits[index] for index in gate.target))
         else:
-            ansatz(gate.value, qubits[gate.target], gate.gate)
+            ansatz(angle, qubits[gate.target], gate.gate)
     return qubits
 
 
@@ -56,7 +57,6 @@ def expectation(
 
 
 # [f(θ+s) - f(θ-s)] / (2 sin(s))
-# Útil quando sua função de custo recebe *um escalar*.
 def parameter_shift_gradient(
     num_qubits: int,
     gates: Sequence[GateInstruction],

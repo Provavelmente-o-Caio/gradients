@@ -16,7 +16,7 @@ def ansatz(
     qubits: Quant,
     gate: ParameterizedGate = RY,
 ) -> None:
-    gate(theta, qubits[0])
+    gate(float(theta), qubits[0])
 
 
 # |ψ(θ)>

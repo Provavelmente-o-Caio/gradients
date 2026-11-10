@@ -35,14 +35,17 @@ def hadamard_test_term(
     S(ancilla)
     coefficient, pauli_word = term
 
+    call_index = 0
+
     def controlled_parameter_gate(
         theta: float,
-        parameter: int,
         gate: Callable[..., object],
         target: Quant,
     ) -> None:
-        if parameter == parameter_index:
+        nonlocal call_index
+        if call_index == parameter_index:
             controlled_pauli(pauli_word, qubits, ancilla)
+        call_index += 1
         gate(theta, target)
 
     circuit_builder(thetas, qubits, controlled_parameter_gate)
@@ -90,9 +93,13 @@ def ht_state(thetas, parameter_index, pauli_word, num_qubits, circuit_builder):
     H(ancilla)
     S(ancilla)
 
-    def controlled_parameter_gate(theta, parameter, gate, target):
-        if parameter == parameter_index:
+    call_index = 0
+
+    def controlled_parameter_gate(theta, gate, target):
+        nonlocal call_index
+        if call_index == parameter_index:
             controlled_pauli(pauli_word, qubits, ancilla)
+        call_index += 1
         gate(theta, target)
 
     circuit_builder(thetas, qubits, controlled_parameter_gate)
