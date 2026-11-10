@@ -29,9 +29,6 @@ PARAMETERS = [0.3, 1.1, -0.4, 0.8]
 NUM_QUBITS = 2
 REPETITIONS = 1000
 
-BENCHMARK_OBSERVABLE_GROUPS = group_qubit_commuting(
-    pauli_expansion(grouped_observable, NUM_QUBITS)
-)
 BENCHMARK_OBSERVABLE_TERMS = pauli_expansion(grouped_observable, NUM_QUBITS)
 BENCHMARK_GENERATOR_TERMS = tuple(
     pauli_expansion(generator, NUM_QUBITS) for generator in generators()
@@ -101,24 +98,28 @@ def grouped_many_term_gradient() -> list[float]:
 
 def test_grouping_reduces_measurements() -> None:
     parameters = [0.2, 0.4, 0.6, 0.8]
-    generator_terms = many_qubit_generators()
+    generator_builders = many_qubit_generators()
     _, grouped_circuits = hadamard_test_gradient_grouped(
         parameters,
         0,
         4,
         many_z_observable,
-        generator_terms,
+        generator_builders,
         many_qubit_ansatz,
     )
 
     observable_terms = 4 + 6
+    grouped = grouped_many_term_gradient()
+    ungrouped = ungrouped_many_term_gradient()
+
+    print("\nGrouping context (many_z_observable, 4 qubits):")
+    print(f"  observable terms without grouping: {observable_terms}")
+    print(f"  measurement groups with grouping:  {grouped_circuits}")
+    print(f"  reduction factor:                  {observable_terms / grouped_circuits:.1f}x")
+
     assert grouped_circuits == 1
     assert grouped_circuits < observable_terms
-    assert np.allclose(
-        grouped_many_term_gradient(),
-        ungrouped_many_term_gradient(),
-        atol=2e-3,
-    )
+    assert np.allclose(grouped, ungrouped, atol=2e-3)
 
 
 def test_grouping_performance_opportunity() -> None:
@@ -208,8 +209,6 @@ def grouped_hadamard_gradient() -> list[float]:
             grouped_observable,
             generators(),
             benchmark_ansatz,
-            generator_terms=BENCHMARK_GENERATOR_TERMS[parameter_index],
-            observable_groups=BENCHMARK_OBSERVABLE_GROUPS,
         )[0]
         for parameter_index in range(len(PARAMETERS))
     ]
@@ -256,3 +255,5 @@ def test_gradient_performance() -> None:
 
 if __name__ == "__main__":
     test_gradient_performance()
+    test_grouping_reduces_measurements()
+    test_grouping_performance_opportunity()
