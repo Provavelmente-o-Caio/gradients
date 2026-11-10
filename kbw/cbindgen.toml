@@ -1,0 +1,14 @@
+header = """
+/*
+ * SPDX-FileCopyrightText: 2026 Evandro Chagas Ribeiro da Rosa<evandro@quantuloop.com>
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+"""
+
+language = "C"
+pragma_once = true
+cpp_compat = true
+
+[export.rename]
+"QPUConfig" = "void"

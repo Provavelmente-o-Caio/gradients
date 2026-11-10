@@ -1,0 +1,306 @@
+// SPDX-FileCopyrightText: 2026 Evandro Chagas Ribeiro da Rosa <evandro@quantuloop.com>
+//
+// SPDX-License-Identifier: Apache-2.0
+// OpenQASM 2.0 LALRPOP grammar
+// Based strictly on "Appendix A: OpenQASM Grammar" from arXiv:1707.03429v2
+
+use super::ast::*;
+use std::str::FromStr;
+
+grammar;
+
+// ---------------------------------------------------------------------------
+// Lexer token declarations
+// ---------------------------------------------------------------------------
+
+match {
+    // Keywords declared before the generic ID rule
+    "OPENQASM" => TK_OPENQASM,
+    "include"  => TK_INCLUDE,
+    "qreg"     => TK_QREG,
+    "creg"     => TK_CREG,
+    "gate"     => TK_GATE,
+    "opaque"   => TK_OPAQUE,
+    "if"       => TK_IF,
+    "measure"  => TK_MEASURE,
+    "reset"    => TK_RESET,
+    "barrier"  => TK_BARRIER,
+    "U"        => TK_U,
+    "CX"       => TK_CX,
+    "pi"       => TK_PI,
+
+    // Unary math functions (OpenQASM Appendix A)
+    "sin"  => TK_SIN,
+    "cos"  => TK_COS,
+    "tan"  => TK_TAN,
+    "exp"  => TK_EXP,
+    "ln"   => TK_LN,
+    "sqrt" => TK_SQRT,
+
+    // Punctuation / operators
+    "->",
+    "==",
+    ";",
+    ",",
+    "[",
+    "]",
+    "{",
+    "}",
+    "(",
+    ")",
+    "+",
+    "-",
+    "*",
+    "/",
+    "^",
+
+    // Skip whitespace and line comments
+    r"\s+"           => { },
+    r"//[^\n\r]*\n?" => { },
+
+    // Numeric literals
+    r"[0-9]+"                                                          => TK_INT,
+    r"([0-9]+\.[0-9]*|[0-9]*\.[0-9]+)([eE][+-]?[0-9]+)?"             => TK_REAL,
+
+    // String literals for `include`
+    r#""[^"]*""# => TK_STRING,
+
+    // Identifiers: lower-case letter followed by alphanumeric / underscore
+    r"[a-z][A-Za-z0-9_]*" => TK_ID,
+}
+
+// ---------------------------------------------------------------------------
+// Primitive token rules
+// ---------------------------------------------------------------------------
+
+Id: String = <s:TK_ID> => s.to_string();
+
+Int: u64 = <s:TK_INT> => u64::from_str(s).unwrap();
+
+Real: f64 = <s:TK_REAL> => f64::from_str(s).unwrap();
+
+StringLit: String = <s:TK_STRING> => s[1..s.len()-1].to_string();
+
+// ---------------------------------------------------------------------------
+// Top-level program
+// ---------------------------------------------------------------------------
+
+pub Program: Vec<Statement> =
+    TK_OPENQASM VersionLit ";" <stmts:Stmt*> => stmts;
+
+// Accept either `2` or `2.0` as the version literal.
+VersionLit: () = {
+    TK_INT  => (),
+    TK_REAL => (),
+};
+
+// ---------------------------------------------------------------------------
+// Statements
+// ---------------------------------------------------------------------------
+
+Stmt: Statement = {
+    // Register declarations
+    TK_QREG <id:Id> "[" <n:Int> "]" ";"
+        => Statement::QReg(id, n as usize),
+    TK_CREG <id:Id> "[" <n:Int> "]" ";"
+        => Statement::CReg(id, n as usize),
+
+    // Include
+    TK_INCLUDE <s:StringLit> ";"
+        => Statement::Include(s),
+
+    // Gate definition: gate id(params?) qargs { body }
+    TK_GATE <id:Id> <params:GateParamDecl> <qargs:GateQargDecl> <body:GateBody>
+        => Statement::GateDef(id, params, qargs, body),
+
+    // Opaque gate declaration (no body)
+    TK_OPAQUE <id:Id> <params:GateParamDecl> <qargs:GateQargDecl> ";"
+        => Statement::OpaqueGate(id, params, qargs),
+
+    // Top-level quantum operations
+    <op:QOp> => Statement::QOp(op),
+
+    // if statement
+    TK_IF "(" <id:Id> "==" <n:Int> ")" <op:QOp>
+        => Statement::If(id, n, op),
+
+    // Barrier
+    TK_BARRIER <args:AnyList> ";"
+        => Statement::Barrier(args),
+};
+
+// Optional parameter declaration list: `(id, id, ...)` or empty.
+GateParamDecl: Vec<String> = {
+    "(" <ids:IdListInner> ")" => ids,
+    "(" ")"                   => vec![],
+    /* no parens at all */    => vec![],
+};
+
+// Non-empty identifier list: used for parameter & qubit declarations.
+IdListInner: Vec<String> = {
+    <id:Id>                           => vec![id],
+    <mut v:IdListInner> "," <id:Id>   => { v.push(id); v },
+};
+
+// Qubit argument declaration in gate header (one or more plain identifiers).
+GateQargDecl: Vec<String> = {
+    <ids:IdListInner> => ids,
+};
+
+GateBody: Vec<GateOp> = "{" <ops:GOpStmt*> "}" => ops;
+
+// ---------------------------------------------------------------------------
+// Quantum operations (at top level and after `if`)
+// ---------------------------------------------------------------------------
+
+QOp: QOp = {
+    <g:GateCallTop> ";"                      => QOp::Gate(g),
+    TK_MEASURE <q:Argument> "->" <c:Argument> ";" => QOp::Measure(q, c),
+    TK_RESET   <q:Argument> ";"              => QOp::Reset(q),
+};
+
+// Gate call at top level – qubit arguments are `Argument` (id or id[n]).
+GateCallTop: GateCall = {
+    // Built-in U gate
+    TK_U "(" <params:ExprList> ")" <qarg:Argument>
+        => GateCall { name: "U".to_string(), params, qargs: vec![qarg] },
+
+    // Built-in CX gate
+    TK_CX <q0:Argument> "," <q1:Argument>
+        => GateCall { name: "CX".to_string(), params: vec![], qargs: vec![q0, q1] },
+
+    // User-defined gate, no params
+    <id:Id> <qargs:ArgumentList1>
+        => GateCall { name: id, params: vec![], qargs },
+
+    // User-defined gate, with params
+    <id:Id> "(" <params:ExprListOpt> ")" <qargs:ArgumentList1>
+        => GateCall { name: id, params, qargs },
+};
+
+// ---------------------------------------------------------------------------
+// Gate body operations
+// ---------------------------------------------------------------------------
+
+GOpStmt: GateOp = {
+    <g:GateCallBody> ";"            => GateOp::Gate(g),
+    TK_BARRIER <ids:IdListInner> ";" => GateOp::Barrier(ids),
+};
+
+// Gate call inside a gate body – qubit arguments are plain identifiers only.
+GateCallBody: GateCall = {
+    // Built-in U gate
+    TK_U "(" <params:ExprList> ")" <qarg:Id>
+        => GateCall { name: "U".to_string(), params, qargs: vec![Argument::Id(qarg)] },
+
+    // Built-in CX gate
+    TK_CX <q0:Id> "," <q1:Id>
+        => GateCall {
+               name: "CX".to_string(),
+               params: vec![],
+               qargs: vec![Argument::Id(q0), Argument::Id(q1)],
+           },
+
+    // User-defined gate, no params – one or more id args
+    <id:Id> <first:Id> <rest:BodyQargRest>
+        => {
+            let mut qargs = vec![Argument::Id(first)];
+            qargs.extend(rest.into_iter().map(Argument::Id));
+            GateCall { name: id, params: vec![], qargs }
+        },
+
+    // User-defined gate, with params
+    <id:Id> "(" <params:ExprListOpt> ")" <first:Id> <rest:BodyQargRest>
+        => {
+            let mut qargs = vec![Argument::Id(first)];
+            qargs.extend(rest.into_iter().map(Argument::Id));
+            GateCall { name: id, params, qargs }
+        },
+};
+
+// Zero or more additional qubit arguments after the first one in a gate body.
+// Right-recursive to avoid shift/reduce conflicts with the comma in ExprList.
+BodyQargRest: Vec<String> = {
+    => vec![],
+    "," <id:Id> <rest:BodyQargRest> => {
+        let mut v = vec![id];
+        v.extend(rest);
+        v
+    },
+};
+
+// ---------------------------------------------------------------------------
+// Argument lists (top-level)
+// ---------------------------------------------------------------------------
+
+// Non-empty list of `Argument` values.
+ArgumentList1: Vec<Argument> = {
+    <a:Argument>                              => vec![a],
+    <mut v:ArgumentList1> "," <a:Argument>    => { v.push(a); v },
+};
+
+// `barrier` allows a list of arguments.
+AnyList: Vec<Argument> = ArgumentList1;
+
+// ---------------------------------------------------------------------------
+// Argument: id  or  id[n]
+// ---------------------------------------------------------------------------
+
+Argument: Argument = {
+    <id:Id>                 => Argument::Id(id),
+    <id:Id> "[" <n:Int> "]" => Argument::Indexed(id, n as usize),
+};
+
+// ---------------------------------------------------------------------------
+// Parameter expressions
+// ---------------------------------------------------------------------------
+
+ExprListOpt: Vec<Expr> = {
+    <exprs:ExprList> => exprs,
+    => vec![],
+};
+
+ExprList: Vec<Expr> = {
+    <e:Expr>                          => vec![e],
+    <mut v:ExprList> "," <e:Expr>     => { v.push(e); v },
+};
+
+// Standard precedence: Expr (additive) < Factor (mult) < Power < Unary < Primary.
+Expr: Expr = {
+    <l:Expr> "+" <r:Factor>  => Expr::BinOp(Box::new(l), BinOp::Add, Box::new(r)),
+    <l:Expr> "-" <r:Factor>  => Expr::BinOp(Box::new(l), BinOp::Sub, Box::new(r)),
+    <f:Factor>               => f,
+};
+
+Factor: Expr = {
+    <l:Factor> "*" <r:Power> => Expr::BinOp(Box::new(l), BinOp::Mul, Box::new(r)),
+    <l:Factor> "/" <r:Power> => Expr::BinOp(Box::new(l), BinOp::Div, Box::new(r)),
+    <p:Power>                => p,
+};
+
+Power: Expr = {
+    <b:Unary> "^" <e:Power>  => Expr::BinOp(Box::new(b), BinOp::Pow, Box::new(e)),
+    <u:Unary>                => u,
+};
+
+Unary: Expr = {
+    "-" <e:Primary> => Expr::Neg(Box::new(e)),
+    <e:Primary>     => e,
+};
+
+Primary: Expr = {
+    <r:Real>  => Expr::Real(r),
+    <n:Int>   => Expr::Real(n as f64),
+    TK_PI     => Expr::Pi,
+    <id:Id>   => Expr::Id(id),
+
+    // Unary math functions (OpenQASM Appendix A §2.2)
+    TK_SIN  "(" <e:Expr> ")" => Expr::UnaryFn(UnaryFn::Sin,  Box::new(e)),
+    TK_COS  "(" <e:Expr> ")" => Expr::UnaryFn(UnaryFn::Cos,  Box::new(e)),
+    TK_TAN  "(" <e:Expr> ")" => Expr::UnaryFn(UnaryFn::Tan,  Box::new(e)),
+    TK_EXP  "(" <e:Expr> ")" => Expr::UnaryFn(UnaryFn::Exp,  Box::new(e)),
+    TK_LN   "(" <e:Expr> ")" => Expr::UnaryFn(UnaryFn::Ln,   Box::new(e)),
+    TK_SQRT "(" <e:Expr> ")" => Expr::UnaryFn(UnaryFn::Sqrt, Box::new(e)),
+
+    "(" <e:Expr> ")" => e,
+};

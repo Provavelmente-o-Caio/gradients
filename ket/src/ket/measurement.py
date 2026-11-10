@@ -1,0 +1,466 @@
+"""Quantum measurement result classes.
+
+This module provides :class:`~ket.measurement.Measurement` and
+:class:`~ket.measurement.Samples`, the two primary result handles for
+collecting classical data from a quantum circuit:
+
+- :class:`~ket.measurement.Measurement` stores the outcome of a single
+  projective measurement in the computational basis.
+- :class:`~ket.measurement.Samples` accumulates counts over many shots,
+  producing an empirical probability distribution over basis states.
+
+:class:`~ket.measurement.Samples` class is lazy: in **batch** execution mode
+the results are deferred until the process executes, which happens
+automatically when ``.get()`` is accessed.
+
+Prefer using the top-level functions :func:`~ket.operations.measure` and
+:func:`~ket.operations.sample` to create these objects.
+"""
+
+from __future__ import annotations
+
+# SPDX-FileCopyrightText: 2020 Evandro Chagas Ribeiro da Rosa <evandro@quantuloop.com>
+# SPDX-FileCopyrightText: 2020 Rafael de Santiago <r.santiago@ufsc.br>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+
+from ctypes import c_size_t
+import json
+from typing import Callable, Literal, Any
+
+from ket.expv import Hamiltonian
+
+from .clib.libket import HasProcess, API as libket
+from .base import Quant
+
+try:
+    import plotly.graph_objs as go
+    import plotly.express as px
+
+    VISUALIZE = True
+except ImportError:
+    VISUALIZE = False
+
+__all__ = [
+    "Samples",
+    "Measurement",
+]
+
+
+class Measurement(HasProcess):
+    """Quantum measurement result.
+
+    This class holds a reference for a measurement result. The result may not be available right
+    after the measurement call, especially in batch execution.
+
+    To read the value, access the attribute :attr:`~ket.base.Measurement.value`.
+
+    You can instantiate this class by calling the :func:`~ket.operations.measure` function.
+
+    Example:
+
+        .. code-block:: python
+
+            from ket import *
+
+            p = Process()
+            q = p.alloc(2)
+            CNOT(H(q[0]), q[1])
+            result = measure(q)
+            print(result.value)  # 0 or 3
+    """
+
+    def __init__(
+        self,
+        qubits: Quant,
+        postprocessing: Callable[[int], Any] | None = None,
+    ):
+        super().__init__(ket_process=qubits.ket_process)
+
+        if any(self.ket_process._is_aux(q) for q in qubits.qubits):
+            raise ValueError("Auxiliary qubits cannot be measured")
+
+        self.ket_process._check_not_in_block("measure")
+
+        self.qubits = [qubits.qubits[i : i + 64] for i in range(0, len(qubits), 64)]
+        self.size = len(qubits)
+        result_values = [
+            self.ket_process.measure((c_size_t * len(qubit))(*qubit), len(qubit)).value
+            for qubit in self.qubits
+        ]
+
+        self._value = 0
+        for value, qubit in zip(result_values, self.qubits):
+            self._value <<= len(qubit)
+            self._value |= value
+
+        self.postprocessing = postprocessing
+
+    @property
+    def value(self) -> Any:
+        """The measurement outcome as a (possibly post-processed) value.
+
+        If a ``postprocessing`` callable was supplied at construction (e.g.,
+        for :class:`~ket.qint.Qint` conversion), it is applied to the raw
+        integer outcome before returning.
+
+        Returns:
+            The post-processed measurement outcome.
+        """
+        if self.postprocessing is not None and self._value is not None:
+            return self.postprocessing(self._value)
+        return self._value
+
+    @property
+    def raw_value(self) -> int:
+        """The raw (pre-postprocessing) measurement outcome as an unsigned integer.
+
+        Returns:
+            The measurement result as a plain integer.
+        """
+        return self._value
+
+    @property
+    def bitstring(self) -> str:
+        """The measurement outcome as a zero-padded binary string.
+
+        Converts the raw integer outcome to a binary string of length
+        ``len(qubits)``, with the most-significant bit corresponding to the
+        first qubit in the register.
+
+        Returns:
+            A binary string such as ``'0101'``.
+        """
+        if self._value is not None:
+            return f"{self._value:0{self.size}b}"
+
+        return self._value
+
+    def get(self) -> Any:
+        """The measurement outcome as a (possibly post-processed) value.
+
+        If a ``postprocessing`` callable was supplied at construction (e.g.,
+        for :class:`~ket.qint.Qint` conversion), it is applied to the raw
+        integer outcome before returning.
+
+        Returns:
+            The post-processed measurement outcome.
+        """
+
+        return self.value
+
+    def __repr__(self):
+        return (
+            f"<Ket 'Measurement' "
+            f"value={self.value}, pid={hex(id(self.ket_process))}>"
+        )
+
+
+def _check_visualize():
+    if not VISUALIZE:
+        raise RuntimeError(
+            "Visualization optional dependence are required. Install with: "
+            "pip install ket-lang[plot]"
+        )
+
+
+class Samples(HasProcess):
+    """Quantum state measurement samples.
+
+    This class holds a reference for a measurement sample result. The result may not be available
+    right after the sample call, especially in batch execution.
+
+    To read the value, access the attribute :attr:`~ket.base.Sample.value`. If the value is not
+    available, the measurement will return ``None``; otherwise, it will return a dictionary mapping
+    measurement outcomes to their respective counts.
+
+    You can instantiate this class by calling the :func:`~ket.operations.sample` function.
+
+    Example:
+
+        .. code-block:: python
+
+            from ket import *
+
+            p = Process()
+            q = p.alloc(2)
+            CNOT(H(q[0]), q[1])
+            results = sample(q)
+
+            print(results.value)
+            # {0: 1042, 3: 1006}
+
+    Args:
+        qubits: Qubits for which the measurement samples are obtained.
+        shots: Number of measurement shots (default is 2048).
+
+    """
+
+    def __init__(
+        self,
+        qubits: Quant,
+        shots: int = 2048,
+        postprocessing: Callable[[int], Any] | None = None,
+    ):
+        super().__init__(ket_process=qubits.ket_process)
+
+        self.qubits = qubits.qubits
+        self.size = len(qubits)
+
+        if any(self.ket_process._is_aux(q) for q in self.qubits):
+            raise ValueError("Auxiliary qubits cannot be measured")
+
+        self.ket_process._check_not_in_block("sample")
+
+        result_ptr = self.ket_process.sample(
+            (c_size_t * len(self.qubits))(*self.qubits),
+            len(self.qubits),
+            shots,
+        )
+
+        sample = json.loads(result_ptr.value.decode("utf-8"))
+        if sample is not None:
+            states, counts = sample
+            self._value = {
+                int("".join(f"{s:064b}" for s in state), 2): count
+                for state, count in zip(states, counts)
+            }
+
+        else:
+            self._value = None
+
+        libket["ket_string_delete"](result_ptr)
+
+        self.shots = shots
+        self.postprocessing = postprocessing
+
+    def _check(self):
+        if self._value is None:
+            self.ket_process.execute()
+
+            result_ptr = self.ket_process.read_sample()
+
+            sample = json.loads(result_ptr.value.decode("utf-8"))
+            if sample is not None:
+                states, counts = sample
+                self._value = {
+                    int("".join(f"{s:064b}" for s in state), 2): count
+                    for state, count in zip(states, counts)
+                }
+
+            else:
+                self._value = None
+
+            libket["ket_string_delete"](result_ptr)
+
+    @property
+    def value(self) -> dict[Any, int] | None:
+        """The measurement sample distribution as a dictionary.
+
+        Maps each observed measurement outcome to its count over ``shots``
+        repetitions. If a ``postprocessing`` callable was supplied, the keys
+        are the post-processed outcomes (e.g., signed integers for
+        :class:`~ket.qint.Qint`).
+
+        Returns:
+            A ``{outcome: count}`` dictionary, or
+            ``None`` if the result is not yet available (batch mode).
+        """
+        self._check()
+        if self._value is None:
+            return None
+        if self.postprocessing is not None:
+            return {
+                self.postprocessing(state): count
+                for state, count in self._value.items()
+            }
+        return self._value
+
+    @property
+    def raw_value(self) -> dict[int, int] | None:
+        """The raw sample distribution without postprocessing.
+
+        Returns:
+            A ``{raw_integer_outcome: count}`` dictionary,
+            or ``None`` if not yet available.
+        """
+        self._check()
+        return self._value
+
+    @property
+    def bitstring(self) -> dict[str, int] | None:
+        """The sample distribution with outcomes formatted as binary strings.
+
+        Each key is a zero-padded binary string of length ``len(qubits)``.
+
+        Returns:
+            A ``{'0101': count, ...}`` dictionary,
+            or ``None`` if not yet available.
+        """
+        self._check()
+        if self._value is not None:
+            return {
+                f"{state:0{self.size}b}": count for state, count in self._value.items()
+            }
+        return self._value
+
+    @property
+    def probability(self) -> dict[int, float] | None:
+        """The sample distribution normalized to empirical probabilities.
+
+        Each value is the fraction of shots that produced the corresponding
+        outcome, in the range ``[0.0, 1.0]``.
+
+        Returns:
+            A ``{outcome: probability}`` dictionary,
+            or ``None`` if not yet available.
+        """
+        self._check()
+        if self._value is not None:
+            return {state: count / self.shots for state, count in self._value.items()}
+        return self._value
+
+    def get(self) -> dict[int, int]:
+        """Retrieve the sample distribution, executing the process if necessary.
+
+        Returns:
+            A ``{outcome: count}`` dictionary (with
+            postprocessing applied if configured).
+        """
+
+        self._check()
+        if self._value is None:
+            self.ket_process.execute()
+        return self.value
+
+    def most_frequent_state(self, raw: bool = False) -> int | Any:
+        """Return the most frequently observed measurement outcome.
+
+        Triggers process execution if results are not yet available.
+
+        Args:
+            raw: If ``True``, ignores the postprocessing function and returns the raw integer state.
+
+        Returns:
+            The outcome that appeared most often across all shots. Ties are broken arbitrarily.
+
+        Example:
+
+            .. code-block:: python
+
+                from ket import *
+                p = Process()
+                q = p.alloc(2)
+                X(q[0]) # Prepare state |01> (decimal 1)
+                m = measure(q, shots=100)
+                print(m.most_frequent_state())
+        """
+        state = max(self.get().items(), key=lambda sc: sc[1])[0]
+        if not raw and self.postprocessing is not None:
+            state = self.postprocessing(state)
+        return state
+
+    def histogram(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+        self,
+        mode: Literal["bin", "dec"] = "dec",
+        data: Literal["probability", "count"] = "count",
+        hamiltonian: Callable[[Quant], Hamiltonian] | None = None,
+        plot_filter: Callable[[int, float | int], bool] | None = None,
+        categorical_x: bool | None = None,
+        **kwargs,
+    ) -> go.Figure:
+        """Generate a histogram representing the sample.
+
+        This method creates a histogram visualizing the sample distribution.
+
+        Note:
+            This method requires additional dependencies from ``ket-lang[plot]``.
+
+            Install with: ``pip install ket-lang[plot]``.
+
+        Args:
+            mode: If ``"bin"``, display the states in binary format. If ``"dec"``,
+                display the states in decimal format. Defaults to ``"dec"``.
+            data: Specify whether to plot ``"probability"`` or ``"count"``. Defaults to ``"count"``.
+            hamiltonian: Optional function mapping a Quant to a Hamiltonian to calculate energy.
+            plot_filter: Optional function to filter the plotted data. Takes a state (int) and
+                its value (probability or count, depending on the ``data`` parameter) and returns
+                True to keep the state or False to exclude it.
+            categorical_x: If True, plots bars side-by-side ignoring numeric gaps.
+                If False, spaces bars out based on their integer value.
+                If None (default), automatically switches to categorical if the state spread is
+                too large.
+            **kwargs: Additional keyword arguments passed to :func:`plotly.express.bar`.
+
+        Returns:
+            Histogram of sample measurement.
+        """
+        _check_visualize()
+
+        raw_data = self.get()
+        if data == "probability":
+            metric_data = {
+                state: count / self.shots for state, count in raw_data.items()
+            }
+        else:
+            metric_data = raw_data
+
+        if plot_filter is not None:
+            filtered_data = {
+                state: val
+                for state, val in metric_data.items()
+                if plot_filter(state, val)
+            }
+        else:
+            filtered_data = metric_data
+
+        states = list(filtered_data.keys())
+        values = list(filtered_data.values())
+
+        state_text = (
+            list(map(lambda s: f"|{s:0{len(self.qubits)}b}⟩", states))
+            if mode == "bin"
+            else states
+        )
+
+        plot_data = {
+            "State": states,
+            data.title(): values,
+        }
+
+        if hamiltonian is not None:
+            from .qulib import (  # pylint: disable=import-outside-toplevel,cyclic-import
+                energy,
+            )
+
+            plot_data["Energy"] = [
+                energy(hamiltonian, state, num_qubits=self.size) for state in states
+            ]
+
+        fig = px.bar(
+            plot_data,
+            x="State",
+            y=data.title(),
+            color="Energy" if hamiltonian is not None else None,
+            **kwargs,
+        )
+
+        if categorical_x is None:
+            categorical_x = (max(states) - min(states) > 64) if states else False
+
+        fig.update_layout(
+            xaxis={
+                "type": "category" if categorical_x else "linear",
+                "tickmode": "array",
+                "tickvals": states,
+                "ticktext": state_text,
+                "tickangle": (-90 if mode == "bin" else 0),
+            },
+            bargap=0.2 if categorical_x else 0.75,
+        )
+
+        return fig
+
+    def __repr__(self) -> str:
+        return f"<Ket 'Samples' qubits={self.qubits}, pid={hex(id(self.ket_process))}>"

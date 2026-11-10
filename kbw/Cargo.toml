@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: 2020 Evandro Chagas Ribeiro da Rosa <evandro@quantuloop.com>
+# SPDX-FileCopyrightText: 2020 Rafael de Santiago <r.santiago@ufsc.br>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "kbw"
+version = "0.5.1"
+authors = ["Evandro Chagas Ribeiro da Rosa <evandro@quantuloop.com>"]
+description = "Ket Bitwise Simulator"
+repository = "https://gitlab.com/quantum-ket/kbw"
+documentation = "https://quantumket.org"
+license = "Apache-2.0"
+readme = "README.md"
+edition = "2021"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libket = { path = "../libket" }
+num = "0.4"
+rand = "0.10.2"
+rayon = "1.12.0"
+itertools = "0.15.0"
+thiserror = "2.0.18"
+build-info = { version = "0.0.45", default-features = false, features = [] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+num-traits = "0.2"
+cubecl = { version = "0.11.1", optional = true }
+cudarc = { version = "0.19.10", default-features = false, features = [
+    "cuda-13040",
+    "dynamic-loading",
+], optional = true }
+bimap = { version = "0.6.3", optional = true }
+pollster = { version = "1.0.1", optional = true }
+smallvec = "1.15.2"
+rustc-hash = { version = "2.1.3", optional = true }
+
+[build-dependencies]
+build-info-build = "0.0.45"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+strip = true
+
+[features]
+default = ["dense", "sparse"]
+gpu = ["block", "cubecl/wgpu", "pollster"]
+cuda = ["block", "cubecl/cuda", "dep:cudarc", "pollster"]
+dense = []
+sparse = ["rustc-hash"]
+block = ["bimap"]

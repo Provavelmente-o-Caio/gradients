@@ -1,0 +1,742 @@
+"""Quantum state snapshot representation and visualization.
+
+This module provides :class:`~ket.quantumstate.QuantumState`, which captures a
+complete snapshot of the quantum state from a simulator at a given point in
+the circuit. The snapshot stores the full probability-amplitude dictionary
+:math:`\\{|x\\rangle : \\alpha_x\\}` and exposes utilities for:
+
+- Retrieving amplitudes and probabilities (:attr:`~ket.quantumstate.QuantumState.states`,
+  :attr:`~ket.quantumstate.QuantumState.probability`).
+- Simulating measurement shots from the snapshot
+  (:meth:`~ket.quantumstate.QuantumState.sample`).
+- Pretty-printing the state in plain text or LaTeX
+  (:meth:`~ket.quantumstate.QuantumState.show`).
+- Visualizing a single-qubit state on the Bloch sphere
+  (:meth:`~ket.quantumstate.QuantumState.sphere`).
+- Plotting the probability distribution as an interactive histogram
+  (:meth:`~ket.quantumstate.QuantumState.histogram`).
+
+Visualization methods require the optional ``ket-lang[plot]`` extras::
+
+    pip install ket-lang[plot]
+"""
+
+from __future__ import annotations
+
+# SPDX-FileCopyrightText: 2024 Evandro Chagas Ribeiro da Rosa <evandro@quantuloop.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from fractions import Fraction
+import json
+from math import pi
+from random import Random
+from cmath import phase
+from collections import Counter
+from typing import Literal, Callable
+from ctypes import c_size_t
+
+from .clib.libket import HasProcess, API as libket
+
+from .base import Quant
+from .measurement import _check_visualize
+
+try:
+    import numpy as np
+    import plotly.graph_objs as go
+    import plotly.express as px
+except ImportError:
+    pass
+
+try:
+    from IPython import get_ipython
+    from IPython.display import Math
+
+    try:
+        import google.colab  # pylint: disable=unused-import
+
+        _IN_NOTEBOOK = True
+    except ImportError:
+        _IN_NOTEBOOK = get_ipython().__class__.__name__ == "ZMQInteractiveShell"
+except ImportError:
+    _IN_NOTEBOOK = False
+
+__all__ = ["QuantumState"]
+
+
+class QuantumState(HasProcess):
+    """A snapshot of the full quantum state obtained from a simulator.
+
+    Captures the probability amplitudes of the current quantum state at the
+    point :func:`~ket.operations.dump` is called. The state is stored as a
+    sparse dictionary mapping non-zero basis state integers to their complex
+    amplitudes.
+
+    .. note::
+        This class is available **only with simulators**. It cannot be used
+        with real quantum hardware.
+
+    .. note::
+        Do not instantiate this class directly. Use
+        :func:`~ket.operations.dump` instead.
+
+
+    Example:
+
+        .. code-block:: python
+
+            from ket import *
+
+            p = Process()
+            q = p.alloc(3)
+
+            H(q[0])
+            CNOT(q[0], q[1])   # GHZ-like partial entanglement
+
+            state = dump(q)
+            print(state.show())
+            # |000⟩	(50.00%)
+            # |110⟩	(50.00%)
+
+    Args:
+        *qubits: One or more qubit registers to
+            capture. Registers are labeled independently in the output of
+            :meth:`~ket.quantumstate.QuantumState.show`.
+    """
+
+    def __init__(self, *qubits: Quant):
+        super().__init__(ket_process=qubits[0].ket_process)
+        self.ket_process._check_not_in_block("dump")
+
+        self.qubits = []
+        self.qubits_info: list[tuple[int, Callable[[int], str]]] = []
+
+        for qubit in qubits:
+            self.qubits.extend(qubit.qubits)
+            self.qubits_info.append((len(qubit), qubit.dump_format()))
+
+        dump_prt = self.ket_process.dump(
+            (c_size_t * len(self.qubits))(*self.qubits),
+            len(self.qubits),
+        )
+
+        dump = json.loads(dump_prt.value.decode("utf-8"))
+
+        self._states = {
+            int("".join(f"{s:064b}" for s in state), 2): real + 1j * imag
+            for state, real, imag in zip(
+                dump["basis_states"], dump["amplitudes_real"], dump["amplitudes_imag"]
+            )
+        }
+
+        libket["ket_string_delete"](dump_prt)
+
+        self.size = len(self.qubits)
+
+    @property
+    def states(self) -> dict[int, complex]:
+        """The quantum state as a sparse amplitude dictionary.
+
+        Maps each basis state (an integer whose binary representation gives
+        the qubit values, with the first qubit as the most-significant bit)
+        to its complex probability amplitude.
+
+        Returns:
+            The amplitude dictionary.
+
+        Example:
+
+            .. code-block:: python
+
+                from ket import *
+
+                p = Process()
+                q = p.alloc(2)
+
+                CNOT(H(q[0]), q[1])    # Bell state
+
+                state = dump(q)
+                print(state.states)
+                # {0: (0.7071+0j), 3: (0.7071+0j)}
+        """
+        return self._states
+
+    def get(self) -> dict[int, complex]:
+        """Retrieve the quantum state, executing the process if necessary.
+
+        Returns:
+            The amplitude dictionary (same as
+            :attr:`~ket.quantumstate.QuantumState.states`).
+        """
+        return self.states
+
+    @property
+    def probability(self) -> dict[int, float]:
+        """Measurement probabilities derived from the quantum state amplitudes.
+
+        Maps each basis state to its Born-rule probability
+        :math:`|\\alpha_x|^2`.
+
+        Returns:
+            A ``{basis_state: probability}`` dictionary
+            where probabilities sum to approximately 1.0.
+        """
+        return {state: abs(amp) ** 2 for state, amp in self._states.items()}
+
+    def sample(self, shots=4096, seed=None) -> dict[int, int]:
+        """Simulate measurement sampling directly from the state snapshot.
+
+        Generates ``shots`` measurement outcomes by weighted random sampling
+        from the probability distribution defined by the stored amplitudes.
+        This is deterministic given the same ``seed`` and is faster than
+        re-running the circuit.
+
+        Args:
+            shots: Number of measurement shots to simulate.
+                Defaults to ``4096``.
+            seed: Seed for the random number generator for
+                reproducible results. Defaults to ``None`` (random seed).
+
+        Returns:
+            A ``{basis_state: count}`` dictionary, or
+            ``None`` if the snapshot is not yet available.
+
+        Example:
+
+            .. code-block:: python
+
+                from ket import *
+
+                p = Process()
+                q = p.alloc(2)
+                CNOT(H(q[0]), q[1])    # Bell state
+
+                state = dump(q)
+                counts = state.sample(shots=1000, seed=42)
+                print(counts)
+                # {0: 503, 3: 497}
+        """
+
+        rng = Random(seed)
+        states_list = list(self.states.keys())
+        weights_list = list(self.probability.values())
+
+        shots_result = rng.choices(states_list, weights=weights_list, k=shots)
+
+        return dict(Counter(shots_result))
+
+    @staticmethod
+    def _sphere():  # pylint: disable=too-many-locals
+        phi = np.linspace(0, np.pi, 20)
+        theta = np.linspace(0, 2 * np.pi, 40)
+        phi, theta = np.meshgrid(phi, theta)
+        x = np.sin(phi) * np.cos(theta)
+        y = np.sin(phi) * np.sin(theta)
+        z = np.cos(phi)
+        sphere = go.Surface(
+            x=x, y=y, z=z, showscale=False, opacity=0.02, name="Bloch Sphere"
+        )
+
+        equator_theta = np.linspace(0, 2 * np.pi, 100)
+        equator_x = np.cos(equator_theta)
+        equator_y = np.sin(equator_theta)
+        equator_z = np.zeros_like(equator_theta)
+
+        equator = go.Scatter3d(
+            x=equator_x,
+            y=equator_y,
+            z=equator_z,
+            mode="lines",
+            line={"color": "gray", "width": 3},
+            opacity=0.1,
+            name="Equator",
+        )
+
+        z_line = go.Scatter3d(
+            x=[0, 0],
+            y=[0, 0],
+            z=[1, -1],
+            mode="lines",
+            line={"color": "gray", "width": 3},
+            opacity=0.1,
+            name="z line",
+        )
+
+        x_line = go.Scatter3d(
+            x=[1, -1],
+            y=[0, 0],
+            z=[0, 0],
+            mode="lines",
+            line={"color": "gray", "width": 3},
+            opacity=0.1,
+            name="x line",
+        )
+
+        y_line = go.Scatter3d(
+            x=[0, 0],
+            y=[1, -1],
+            z=[0, 0],
+            mode="lines",
+            line={"color": "gray", "width": 3},
+            opacity=0.1,
+            name="y line",
+        )
+
+        basis_points = [
+            ([0.0, 0.0, 1.0], "|0⟩"),
+            ([0.0, 0.0, 0.8], "Z"),
+            ([0.0, 0.0, -1.0], "|1⟩"),
+            ([1.0, 0.0, 0.0], "|+⟩"),
+            ([0.8, 0.0, 0.0], "X"),
+            ([-1.0, 0.0, 0.0], "|‒⟩"),
+            ([0.0, 1.0, 0.0], "|+i⟩"),
+            ([0.0, 0.8, 0.0], "Y"),
+            ([0.0, -1.0, 0.0], "|-i⟩"),
+        ]
+
+        basis = [
+            go.Scatter3d(
+                x=[p[0]],
+                y=[p[1]],
+                z=[p[2]],
+                mode="text",
+                text=[text],
+                textposition="middle center",
+                name=text,
+            )
+            for p, text in basis_points
+        ]
+
+        return [
+            sphere,
+            equator,
+            x_line,
+            y_line,
+            z_line,
+            *basis,
+        ]
+
+    def sphere(self) -> go.Figure:
+        """Generate an interactive Bloch sphere plot for a single-qubit state.
+
+        Computes the Bloch vector :math:`(\\langle X \\rangle, \\langle Y \\rangle,
+        \\langle Z \\rangle)` from the state snapshot and renders it as a 3-D
+        Plotly figure with the standard basis labels.
+
+        .. note::
+            Requires the optional ``ket-lang[plot]`` extras::
+
+                pip install ket-lang[plot]
+
+        Returns:
+            An interactive 3-D Bloch sphere
+            visualization of the current single-qubit state.
+
+        Raises:
+            ValueError: If the snapshot contains more than 1 qubit.
+        """
+        if len(self.qubits) != 1:
+            raise ValueError("Bloch sphere plot is available only for 1 qubit")
+        _check_visualize()
+
+        state_dict = self.get()
+        ket = np.array(
+            [
+                [state_dict.get(0, 0.0)],
+                [state_dict.get(1, 0.0)],
+            ]
+        )
+
+        bra = np.conjugate(ket.T)
+
+        pauli_x = np.array([[0, 1], [1, 0]])
+        pauli_y = np.array([[0, -1j], [1j, 0]])
+        pauli_z = np.array([[1, 0], [0, -1]])
+        exp_x = (bra @ pauli_x @ ket).item().real
+        exp_y = (bra @ pauli_y @ ket).item().real
+        exp_z = (bra @ pauli_z @ ket).item().real
+
+        qubit = go.Scatter3d(
+            x=[exp_x],
+            y=[exp_y],
+            z=[exp_z],
+            mode="markers",
+            marker={"size": 5, "color": "red"},
+            name="qubit",
+        )
+
+        line = go.Scatter3d(
+            x=[0, exp_x],
+            y=[0, exp_y],
+            z=[0, exp_z],
+            mode="lines",
+            line={"color": "red", "width": 3},
+            opacity=0.5,
+            name="qubit line",
+        )
+
+        fig = go.Figure(
+            data=[
+                *self._sphere(),
+                qubit,
+                line,
+            ]
+        )
+
+        fig.update_layout(
+            scene={
+                "xaxis": {
+                    "range": [-1, 1],
+                    "showgrid": False,
+                    "showbackground": False,
+                    "visible": False,
+                },
+                "yaxis": {
+                    "range": [-1, 1],
+                    "showgrid": False,
+                    "showbackground": False,
+                    "visible": False,
+                },
+                "zaxis": {
+                    "range": [-1, 1],
+                    "showgrid": False,
+                    "showbackground": False,
+                    "visible": False,
+                },
+                "aspectmode": "cube",
+                "camera": {
+                    "eye": {
+                        "x": 0.8,
+                        "y": 0.8,
+                        "z": 0.8,
+                    },
+                },
+            },
+            showlegend=False,
+        )
+
+        return fig
+
+    def show(
+        self,
+        mode: Literal["latex", "str"] | None = None,
+        polar: bool = False,
+        round_tol: float = 1e-6,
+    ) -> str:
+        r"""Format the quantum state as a human-readable string or LaTeX expression.
+
+        Renders each non-negligible basis state with its probability amplitude
+        in Dirac notation (ket notation). In a Jupyter Notebook, the default
+        output is a rendered LaTeX expression; in a terminal it is plain text.
+
+        Args:
+            mode: Output format. ``'str'``
+                produces a plain-text string; ``'latex'`` produces an
+                :class:`~IPython.display.Math` object for Jupyter rendering.
+                Defaults to ``'latex'`` in notebooks, ``'str'`` otherwise.
+            polar: If ``True``, display amplitudes in polar form
+                :math:`r \cdot e^{i\theta}`. Defaults to ``False``
+                (Cartesian form).
+            round_tol: Amplitudes with absolute value below this
+                threshold are considered zero and omitted. Defaults to
+                ``1e-6``.
+
+        Returns:
+            The formatted state string,
+            or a LaTeX ``Math`` object when in a notebook.
+
+        Example:
+
+            .. code-block:: python
+
+                from ket import *
+
+                p = Process()
+                q = p.alloc(2)
+                CNOT(H(q[0]), q[1])   # Bell state
+
+                state = dump(q)
+                print(state.show(mode='str'))
+                # |00⟩	(50.00%)
+                #  0.707107        ≅   1/√2
+                # |11⟩	(50.00%)
+                #  0.707107        ≅   1/√2
+        """
+        if mode is None:
+            mode = "latex" if _IN_NOTEBOOK else "str"
+        elif mode not in ("latex", "str"):
+            raise ValueError(f"Unknown mode: {mode}")
+
+        if mode == "latex":
+            return self._show_latex(round_tol, polar)
+        return self._show_str(round_tol, polar)
+
+    def _get_ket_parts(self, state_bin: str, latex: bool = False) -> list[str]:
+        """Helper to extract, slice and format the inner value of a ket state."""
+        parts = []
+        current = 0
+        for size, formatter in self.qubits_info:
+            slice_bin = state_bin[current : current + size]
+            val = int(slice_bin, 2) if slice_bin else 0
+            formatted_val = formatter(val)
+
+            if latex:
+                parts.append(f"\\left|{formatted_val}\\right>")
+            else:
+                parts.append(f"|{formatted_val}⟩")
+
+            current += size
+        return parts
+
+    def _format_phase(
+        self, theta: float, latex: bool = False, round_tol: float = 1e-6
+    ) -> str:
+        """Helper to format phase angle as a neat fraction of pi if possible."""
+        if abs(theta) < round_tol:
+            return ""
+
+        theta_pi = theta / pi
+        frac = Fraction(theta_pi).limit_denominator(100)
+
+        if abs(frac - theta_pi) < round_tol:
+            num, den = frac.numerator, frac.denominator
+            if num == 0:
+                return ""
+
+            if num == 1:
+                num_str = ""
+            elif num == -1:
+                num_str = "-"
+            else:
+                num_str = str(num)
+
+            pi_str = "\\pi" if latex else "π"
+
+            if den == 1:
+                return f"{num_str}{pi_str}"
+
+            if latex:
+                sign = "-" if num < 0 else ""
+                abs_num = abs(num)
+                top_str = f"{abs_num if abs_num != 1 else ''}{pi_str}"
+                return f"{sign}\\frac{{{top_str}}}{{{den}}}"
+
+            return f"{num_str}{pi_str}/{den}"
+
+        return f"{theta:.4f}"
+
+    def _show_str(  # pylint: disable=too-many-locals
+        self, round_tol: float = 1e-6, polar: bool = False
+    ) -> str:
+
+        def state_amp_str(state, amp):
+            if abs(amp) < round_tol:
+                return ""
+
+            state_bin = f"{state:0{self.size}b}"
+
+            ket_parts = self._get_ket_parts(state_bin, latex=False)
+            dump_str = "".join(ket_parts)
+
+            dump_str += f"\t({100*abs(amp)**2:.2f}%)\n"
+
+            amp_sq = abs(amp) ** 2
+            sqrt_dem_val = 1 / amp_sq if amp_sq > 0 else 0
+            use_sqrt = abs(round(sqrt_dem_val) - sqrt_dem_val) < round_tol
+
+            if polar:
+                r = abs(amp)
+                theta = phase(amp)
+                phase_str = self._format_phase(theta, latex=False, round_tol=round_tol)
+
+                r_str = f"{r:9.6f}"
+                sqrt_str = (
+                    f"\t≅ 1/√{round(sqrt_dem_val)}"
+                    if use_sqrt and round(sqrt_dem_val) != 1
+                    else ""
+                )
+
+                if phase_str:
+                    if phase_str.startswith("-"):
+                        dump_str += f"{r_str}·e^(-i{phase_str[1:]})" + sqrt_str
+                    else:
+                        dump_str += f"{r_str}·e^(i{phase_str})" + sqrt_str
+                else:
+                    dump_str += f"{r_str}         " + sqrt_str
+
+                return dump_str
+
+            real = abs(amp.real) > round_tol
+            real_l0 = amp.real < 0
+
+            imag = abs(amp.imag) > round_tol
+            imag_l0 = amp.imag < 0
+
+            use_sqrt = use_sqrt and (
+                (abs(abs(amp.real) - abs(amp.imag)) < round_tol) or (real != imag)
+            )
+
+            sqrt_dem = f"/√{round(sqrt_dem_val)}"
+
+            if real and imag:
+                sqrt_dem = f"/√{round(2 * sqrt_dem_val)}"
+                sqrt_num = ("(-1" if real_l0 else " (1") + ("-i" if imag_l0 else "+i")
+
+                sqrt_str = (
+                    f"\t≅ {sqrt_num}){sqrt_dem}"
+                    if use_sqrt and (abs(abs(amp.real) - abs(amp.imag)) < round_tol)
+                    else ""
+                )
+                dump_str += f"{amp.real:9.6f}{amp.imag:+.6f}i" + sqrt_str
+
+            elif real:
+                sqrt_num = "  -1" if real_l0 else "   1"
+                sqrt_str = f"\t≅   {sqrt_num}{sqrt_dem}" if use_sqrt else ""
+                dump_str += f"{amp.real:9.6f}       " + sqrt_str
+
+            else:
+                sqrt_num = "  -i" if imag_l0 else "   i"
+                sqrt_str = f"\t≅   {sqrt_num}{sqrt_dem}" if use_sqrt else ""
+                dump_str += f" {amp.imag:17.6f}i" + sqrt_str
+
+            return dump_str
+
+        lines = [
+            state_amp_str(state, amp)
+            for state, amp in sorted(self.get().items(), key=lambda k: k[0])
+        ]
+        return "\n".join(line for line in lines if line)
+
+    def _show_latex(  # pylint: disable=too-many-locals,too-many-statements
+        self, round_tol: float = 1e-6, polar: bool = False
+    ) -> Math:
+
+        def float_to_math(num: float, is_complex: bool) -> str | None:
+            if abs(num) < round_tol:
+                return None
+
+            sqrt_dem_float = 1 / num**2
+            sqrt_dem = round(sqrt_dem_float)
+            if abs(sqrt_dem - sqrt_dem_float) < round_tol and sqrt_dem != 1:
+                sign = "-" if num < 0.0 else ""
+                numerator = "i" if is_complex else "1"
+                return f"\\frac{{{sign}{numerator}}}{{\\sqrt{{{sqrt_dem}}}}}"
+
+            round_num = round(num)
+            if abs(round_num - num) < round_tol:
+                if round_num == 1:
+                    num_str = ""
+                elif round_num == -1:
+                    num_str = "-"
+                else:
+                    num_str = str(round_num)
+            else:
+                num_str = str(num)
+                if "e" in num_str:
+                    num_str = num_str.replace("e", "\\times10^{") + "}"
+
+            if is_complex:
+                num_str += "i"
+                if num_str in ("i", "-i"):
+                    pass
+
+            return num_str
+
+        math_terms = []
+        for state, amp in self.get().items():
+            if abs(amp) < round_tol:
+                continue
+
+            state_bin = f"{state:0{len(self.qubits)}b}"
+            state_parts = self._get_ket_parts(state_bin, latex=True)
+            state_str_joined = "".join(state_parts)
+
+            if polar:
+                r = abs(amp)
+                theta = phase(amp)
+
+                r_str = float_to_math(r, False)
+                if r_str is None:  # Safety check
+                    continue
+
+                phase_str = self._format_phase(theta, latex=True, round_tol=round_tol)
+
+                if phase_str:
+                    if phase_str.startswith("-"):
+                        coeff = f"{r_str}\\cdot \\exp({{-i{phase_str[1:]}}})"
+                    else:
+                        coeff = f"{r_str}\\cdot \\exp({{i{phase_str}}})"
+                else:
+                    coeff = r_str
+
+                math_terms.append(f"{coeff}{state_str_joined}")
+
+            else:
+                real_str = float_to_math(amp.real, False)
+                imag_str = float_to_math(amp.imag, True)
+
+                if real_str is not None and imag_str is not None:
+                    math_terms.append(f"({real_str}+{imag_str}){state_str_joined}")
+                else:
+                    coeff = real_str if real_str is not None else imag_str
+                    math_terms.append(f"{coeff}{state_str_joined}")
+
+        return Math("+".join(math_terms).replace("+-", "-"))
+
+    def histogram(self, mode: Literal["bin", "dec"] = "dec", **kwargs) -> go.Figure:
+        """Generate a histogram representing the quantum state.
+
+        This method creates a histogram visualizing the probability distribution
+        of the quantum state.
+
+        Note:
+            This method requires additional dependencies from ``ket-lang[plot]``.
+
+            Install with: ``pip install ket-lang[plot]``.
+
+        Args:
+            mode: If ``"bin"``, display the states in binary format. If ``"dec"``,
+                display the states in decimal format. Defaults to ``"dec"``.
+            **kwargs: Additional keyword arguments passed to :func:`plotly.express.bar`.
+
+        Returns:
+            Histogram of the quantum state.
+        """
+        _check_visualize()
+
+        state = list(self.get().keys())
+        state_text = (
+            [f"|{s:0{self.size}b}⟩" for s in state]
+            if mode == "bin"
+            else [f"|{s}⟩" for s in state]
+        )
+
+        values = self.get().values()
+        data = {
+            "State": state,
+            "Probability": [abs(a) ** 2 for a in values],
+            "Phase": [phase(a) for a in values],
+        }
+
+        fig = px.bar(
+            data,
+            x="State",
+            y="Probability",
+            color="Phase",
+            range_color=(-pi, pi),
+            **kwargs,
+        )
+
+        fig.update_layout(
+            xaxis={
+                "tickmode": "array",
+                "ticktext": state_text,
+                "tickvals": state,
+            },
+            bargap=0.75,
+        )
+
+        return fig
+
+    def __repr__(self):
+        return f"<Ket 'QuantumState' qubits={self.qubits}, pid={hex(id(self.ket_process))}>"

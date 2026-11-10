@@ -1,0 +1,194 @@
+# SPDX-FileCopyrightText: 2024 Evandro Chagas Ribeiro da Rosa <evandro@quantuloop.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+stages:
+  - lint
+  - test
+  - build
+  - deploy
+
+# Redirect Cargo's home into the project directory so GitLab's cache can
+# pick it up reliably (the default ~/.cargo is outside the project root).
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+
+# ---------------------------------------------------------------------------
+# Lint stage
+# ---------------------------------------------------------------------------
+
+cargo-clippy:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:linux-2.34-1.97
+  stage: lint
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull-push
+    - key: cargo-debug-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/debug/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo clippy --all-features -- -D warnings
+
+reuse:
+  image: ghcr.io/astral-sh/uv:python3.10-trixie-slim
+  stage: lint
+  script:
+    - uvx reuse[charset-normalizer] lint
+
+# ---------------------------------------------------------------------------
+# Test stage
+# ---------------------------------------------------------------------------
+
+cargo-test:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:linux-2.34-1.97
+  stage: test
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull-push
+    - key: cargo-debug-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/debug/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo test --all-features
+
+# ---------------------------------------------------------------------------
+# Build stage
+# ---------------------------------------------------------------------------
+
+# glibc >= 2.28, default features (dense + sparse).
+linux-build:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:linux-2.28-1.97
+  stage: build
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull
+    - key: cargo-release-linux-2.28-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/release/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo build --release
+    - cp target/release/libkbw.so libkbw.so
+  artifacts:
+    paths:
+      - libkbw.so
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# glibc >= 2.34, default features + GPU (wgpu) and CUDA.
+linux-gpu-build:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:linux-2.34-1.97
+  stage: build
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull
+    - key: cargo-release-linux-2.34-gpu-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/release/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo build --release -F gpu,cuda
+    - cp target/release/libkbw.so libkbw.gpu.so
+  artifacts:
+    paths:
+      - libkbw.gpu.so
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+windows-build:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:windows-1.97
+  stage: build
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull-push
+    - key: cargo-release-windows-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/x86_64-pc-windows-gnu/release/
+        - target/debug/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo build --release --target x86_64-pc-windows-gnu
+  artifacts:
+    paths:
+      - target/x86_64-pc-windows-gnu/release/kbw.dll
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+macos-build:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:macos-1.97
+  stage: build
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull
+    - key: cargo-release-macos-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/universal2-apple-darwin/release/
+        - target/aarch64-apple-darwin/release/
+        - target/x86_64-apple-darwin/release/
+        - target/release/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo zigbuild --release --target universal2-apple-darwin
+  artifacts:
+    paths:
+      - target/universal2-apple-darwin/release/libkbw.dylib
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ---------------------------------------------------------------------------
+# Deploy stage
+# ---------------------------------------------------------------------------
+
+publish:
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - |
+      curl --location --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+           --upload-file libkbw.so \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kbw/${CI_COMMIT_SHORT_SHA}/libkbw.so"
+    - |
+      curl --location --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+           --upload-file libkbw.gpu.so \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kbw/${CI_COMMIT_SHORT_SHA}/libkbw.gpu.so"
+    - |
+      curl --location --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+           --upload-file target/x86_64-pc-windows-gnu/release/kbw.dll \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kbw/${CI_COMMIT_SHORT_SHA}/kbw.dll"
+    - |
+      curl --location --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+           --upload-file target/universal2-apple-darwin/release/libkbw.dylib \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kbw/${CI_COMMIT_SHORT_SHA}/libkbw.dylib"

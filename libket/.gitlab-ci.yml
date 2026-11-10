@@ -1,0 +1,163 @@
+# SPDX-FileCopyrightText: 2024 Evandro Chagas Ribeiro da Rosa <evandro@quantuloop.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+stages:
+  - lint
+  - test
+  - build
+  - deploy
+
+# Redirect Cargo's home into the project directory so GitLab's cache can
+# pick it up reliably (the default ~/.cargo is outside the project root).
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+
+# ---------------------------------------------------------------------------
+# Lint stage
+# ---------------------------------------------------------------------------
+
+cargo-clippy:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:linux-2.28-1.97
+  stage: lint
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull-push
+    - key: cargo-debug-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/debug/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo clippy --all-features -- -D warnings
+
+reuse:
+  image: ghcr.io/astral-sh/uv:python3.10-trixie-slim
+  stage: lint
+  script:
+    - uvx reuse[charset-normalizer] lint
+
+# ---------------------------------------------------------------------------
+# Test stage
+# ---------------------------------------------------------------------------
+
+cargo-test:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:linux-2.28-1.97
+  stage: test
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull-push
+    - key: cargo-debug-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/debug/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo test --all-features
+
+# ---------------------------------------------------------------------------
+# Build stage
+# ---------------------------------------------------------------------------
+
+linux-build:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:linux-2.28-1.97
+  stage: build
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull
+    - key: cargo-release-linux-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/release/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo build --release
+  artifacts:
+    paths:
+      - target/release/libket.so
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+windows-build:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:windows-1.97
+  stage: build
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull-push
+    - key: cargo-release-windows-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/x86_64-pc-windows-gnu/release/
+        - target/debug/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo build --release --target x86_64-pc-windows-gnu
+  artifacts:
+    paths:
+      - target/x86_64-pc-windows-gnu/release/ket.dll
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+macos-build:
+  image: registry.gitlab.com/quantum-ket/ket-building-images:macos-1.97
+  stage: build
+  cache:
+    - key: cargo-registry-v1
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+      policy: pull
+    - key: cargo-release-macos-$CI_COMMIT_REF_SLUG
+      paths:
+        - target/universal2-apple-darwin/release/
+        - target/aarch64-apple-darwin/release/
+        - target/x86_64-apple-darwin/release/
+        - target/release/
+        - target/.rustc_info.json
+        - target/CACHEDIR.TAG
+      policy: pull-push
+  script:
+    - cargo zigbuild --release --target universal2-apple-darwin
+  artifacts:
+    paths:
+      - target/universal2-apple-darwin/release/libket.dylib
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ---------------------------------------------------------------------------
+# Deploy stage
+# ---------------------------------------------------------------------------
+
+publish:
+  stage: deploy
+  script:
+    - |
+      curl --location --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+           --upload-file target/release/libket.so \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/libket/${CI_COMMIT_SHORT_SHA}/libket.so"
+    - |
+      curl --location --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+           --upload-file target/x86_64-pc-windows-gnu/release/ket.dll \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/libket/${CI_COMMIT_SHORT_SHA}/ket.dll"
+    - |
+      curl --location --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+           --upload-file target/universal2-apple-darwin/release/libket.dylib \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/libket/${CI_COMMIT_SHORT_SHA}/libket.dylib"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'

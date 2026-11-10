@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2020 Evandro Chagas Ribeiro da Rosa <evandro@quantuloop.com>
+# SPDX-FileCopyrightText: 2020 Rafael de Santiago <r.santiago@ufsc.br>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+*_old
+*.egg*
+**/__pycache__
+build
+builds/
+dist
+**/target
+wheelhouse
+*.so
+.coverage
+.env
+venv
+.vscode/
+.gitlab-ci-local/
+src/ket/clib/libs/kbw/
+src/ket/clib/libs/libket/
+/gcl-builds/
